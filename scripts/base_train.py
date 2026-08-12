@@ -35,6 +35,7 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+from nanochat.babilong_eval import evaluate_babilong
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -75,6 +76,12 @@ parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
+parser.add_argument("--babilong-every", type=int, default=2000, help="evaluate BABILong every N steps (-1 = disable)")
+parser.add_argument("--babilong-tasks", type=str, default="qa1-qa5", help="BABILong tasks, e.g. qa1-qa5 or qa1,qa3")
+parser.add_argument("--babilong-lengths", type=str, default="0k-32k", help="BABILong lengths, e.g. 0k-32k or 0k,4k,32k")
+parser.add_argument("--babilong-max-per-task", type=int, default=-1, help="examples per BABILong task/length (-1 = all 100)")
+parser.add_argument("--babilong-max-new-tokens", type=int, default=20, choices=range(10, 31), metavar="N", help="BABILong greedy generation budget from 10 to 30 tokens")
+parser.add_argument("--babilong-dataset", type=str, default="RMT-team/babilong", help="Hugging Face BABILong dataset repository")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
@@ -460,6 +467,43 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
+        })
+        model.train()
+
+    # BABILong is aggregated independently and never contributes to CORE.
+    babilong_results = {}
+    if args.babilong_every > 0 and (last_step or (step > 0 and step % args.babilong_every == 0)):
+        model.eval()
+        with disable_fp8(orig_model):
+            babilong_results = evaluate_babilong(
+                orig_model,
+                tokenizer,
+                device,
+                tasks=args.babilong_tasks,
+                lengths=args.babilong_lengths,
+                max_per_task=args.babilong_max_per_task,
+                max_new_tokens=args.babilong_max_new_tokens,
+                dataset_name=args.babilong_dataset,
+            )
+        print0(f"Step {step:05d} | BABILong metric: {babilong_results['babilong_metric']:.4f}")
+        babilong_log = {
+            f"babilong/{task}/{length}": score
+            for task, length_scores in babilong_results["results"].items()
+            for length, score in length_scores.items()
+        }
+        babilong_log.update({
+            f"babilong_length/{length}": score
+            for length, score in babilong_results["length_results"].items()
+        })
+        babilong_log.update({
+            f"babilong_task/{task}": score
+            for task, score in babilong_results["task_results"].items()
+        })
+        wandb_run.log({
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "babilong_metric": babilong_results["babilong_metric"],
+            **babilong_log,
         })
         model.train()
 

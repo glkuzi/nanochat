@@ -1,12 +1,13 @@
 """
 Unified evaluation script for base models.
 
-Supports three evaluation modes (comma-separated):
+Supports four evaluation modes (comma-separated):
   --eval core    : CORE metric (accuracy on ICL tasks)
+  --eval babilong: BABILong long-context generative accuracy
   --eval bpb     : Bits per byte on train/val splits
   --eval sample  : Generate samples from the model
 
-Default is all three: --eval core,bpb,sample
+Default is all four: --eval core,babilong,bpb,sample
 
 Examples:
 
@@ -35,6 +36,11 @@ from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.babilong_eval import (
+    evaluate_babilong,
+    parse_babilong_tasks,
+    parse_babilong_lengths,
+)
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -127,10 +133,15 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
-    parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
+    parser.add_argument('--eval', type=str, default='core,babilong,bpb,sample', help='Comma-separated evaluations to run: core,babilong,bpb,sample (default: all)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
+    parser.add_argument('--babilong-tasks', type=str, default='qa1-qa5', help='BABILong tasks, e.g. qa1-qa5 or qa1,qa3 (default: qa1-qa5)')
+    parser.add_argument('--babilong-lengths', type=str, default='0k-32k', help='BABILong context lengths, e.g. 0k-32k or 0k,4k,32k (default: 0k-32k)')
+    parser.add_argument('--babilong-max-per-task', type=int, default=-1, help='Max examples per BABILong task/length (-1 = all 100)')
+    parser.add_argument('--babilong-max-new-tokens', type=int, default=20, choices=range(10, 31), metavar='N', help='Greedy generation budget from 10 to 30 tokens (default: 20)')
+    parser.add_argument('--babilong-dataset', type=str, default='RMT-team/babilong', help='Hugging Face BABILong dataset repository')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
@@ -138,10 +149,15 @@ def main():
 
     # Parse evaluation modes
     eval_modes = set(mode.strip() for mode in args.eval.split(','))
-    valid_modes = {'core', 'bpb', 'sample'}
+    valid_modes = {'core', 'babilong', 'bpb', 'sample'}
     invalid = eval_modes - valid_modes
     if invalid:
         parser.error(f"Invalid eval modes: {invalid}. Valid: {valid_modes}")
+    try:
+        babilong_tasks = parse_babilong_tasks(args.babilong_tasks)
+        babilong_lengths = parse_babilong_lengths(args.babilong_lengths)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
@@ -158,6 +174,7 @@ def main():
 
     # Results to log
     core_results = None
+    babilong_results = None
     bpb_results = {}
     samples = []
     unconditioned_samples = []
@@ -214,6 +231,28 @@ def main():
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
 
+    # --- BABILong evaluation ---
+    if 'babilong' in eval_modes:
+        print0("\n" + "="*80)
+        print0("BABILong Evaluation")
+        print0("="*80)
+        print0(f"Tasks: {', '.join(babilong_tasks)}")
+        print0(f"Lengths: {', '.join(babilong_lengths)}")
+        babilong_results = evaluate_babilong(
+            model,
+            tokenizer,
+            device,
+            tasks=babilong_tasks,
+            lengths=babilong_lengths,
+            max_per_task=args.babilong_max_per_task,
+            max_new_tokens=args.babilong_max_new_tokens,
+            dataset_name=args.babilong_dataset,
+        )
+        print0("\nBABILong length aggregates:")
+        for length, score in babilong_results["length_results"].items():
+            print0(f"  {length}: {score:.4f}")
+        print0(f"BABILong metric: {babilong_results['babilong_metric']:.4f}")
+
     # --- CORE evaluation ---
     if 'core' in eval_modes:
         print0("\n" + "="*80)
@@ -221,20 +260,32 @@ def main():
         print0("="*80)
         core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task)
 
-        # Write CSV output
-        if ddp_rank == 0:
-            base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
-            os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
-            with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
-                for label in core_results["results"]:
-                    acc = core_results["results"][label]
-                    centered = core_results["centered_results"][label]
-                    f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
-                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
-            print0(f"\nResults written to: {output_csv_path}")
-            print0(f"CORE metric: {core_results['core_metric']:.4f}")
+        print0(f"CORE metric: {core_results['core_metric']:.4f}")
+
+    # Write CORE and BABILong task scores together. BABILong rows never enter
+    # the centered CORE aggregation; their summaries are emitted independently.
+    if ddp_rank == 0 and (core_results is not None or babilong_results is not None):
+        base_dir = get_base_dir()
+        output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+        os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+        with open(output_csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Benchmark", "Task", "Length", "Accuracy", "Centered"])
+            if core_results is not None:
+                for label, accuracy in core_results["results"].items():
+                    writer.writerow(["CORE", label, "", f"{accuracy:.6f}", f"{core_results['centered_results'][label]:.6f}"])
+                writer.writerow(["CORE", "CORE", "", "", f"{core_results['core_metric']:.6f}"])
+            if babilong_results is not None:
+                for task in babilong_results["tasks"]:
+                    for length in babilong_results["lengths"]:
+                        accuracy = babilong_results["results"][task][length]
+                        writer.writerow(["BABILong", task, length, f"{accuracy:.6f}", ""])
+                for task, accuracy in babilong_results["task_results"].items():
+                    writer.writerow(["BABILong", task, "ALL", f"{accuracy:.6f}", ""])
+                for length, accuracy in babilong_results["length_results"].items():
+                    writer.writerow(["BABILong", "ALL", length, f"{accuracy:.6f}", ""])
+                writer.writerow(["BABILong", "BABILong", "ALL", f"{babilong_results['babilong_metric']:.6f}", ""])
+        print0(f"\nResults written to: {output_csv_path}")
 
     compute_cleanup()
 
