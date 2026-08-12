@@ -28,6 +28,7 @@ BABILONG_LENGTHS = (
 DEFAULT_BABILONG_TASKS = BABILONG_TASKS[:5]
 DEFAULT_BABILONG_LENGTHS = BABILONG_LENGTHS[:7]
 DEFAULT_BABILONG_BATCH_SIZE = 8
+BABILONG_SUBSAMPLE_SEED = 1337
 
 
 _TASK_INSTRUCTIONS = {
@@ -369,7 +370,7 @@ def evaluate_babilong(
             # Match CORE's deterministic subsampling without assuming the full
             # Hugging Face datasets package is installed.
             indices = list(range(len(data)))
-            random.Random(1337).shuffle(indices)
+            random.Random(BABILONG_SUBSAMPLE_SEED).shuffle(indices)
             if max_per_task > 0:
                 indices = indices[:max_per_task]
             if not indices:
@@ -432,6 +433,9 @@ def evaluate_babilong(
         "tasks": list(selected_tasks),
         "lengths": list(selected_lengths),
         "batch_size": batch_size,
+        "seeds": {
+            "subsample": BABILONG_SUBSAMPLE_SEED,
+        },
         "eval_time": {
             "per_task_per_length_seconds": cell_eval_seconds,
             "per_task_seconds": task_eval_seconds,
@@ -448,6 +452,7 @@ __all__ = [
     "DEFAULT_BABILONG_TASKS",
     "DEFAULT_BABILONG_LENGTHS",
     "DEFAULT_BABILONG_BATCH_SIZE",
+    "BABILONG_SUBSAMPLE_SEED",
     "parse_babilong_tasks",
     "parse_babilong_lengths",
     "format_babilong_prompt",

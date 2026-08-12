@@ -32,7 +32,7 @@ import torch
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
-from nanochat.core_eval import evaluate_task
+from nanochat.core_eval import CORE_FEWSHOT_SEED_BASE, evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -46,6 +46,7 @@ from nanochat.babilong_eval import (
 # CORE evaluation
 
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
+CORE_SUBSAMPLE_SEED = 1337
 
 
 def place_eval_bundle(file_path):
@@ -108,7 +109,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             data = [json.loads(line.strip()) for line in f]
 
         # Shuffle for consistent subsampling when using max_per_task
-        shuffle_rng = random.Random(1337)
+        shuffle_rng = random.Random(CORE_SUBSAMPLE_SEED)
         shuffle_rng.shuffle(data)
         if max_per_task > 0:
             data = data[:max_per_task]
@@ -131,6 +132,10 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             "per_task_seconds": task_eval_seconds,
             "total_seconds": sum(task_eval_seconds.values()),
         },
+        "seeds": {
+            "subsample": CORE_SUBSAMPLE_SEED,
+            "fewshot_base": CORE_FEWSHOT_SEED_BASE,
+        },
     }
     return out
 
@@ -152,6 +157,8 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--seed', type=int, default=42, help='Global Python/NumPy/PyTorch seed (default: 42)')
+    parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=True, help='Require deterministic algorithms (default: enabled)')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -168,7 +175,9 @@ def main():
 
     # Distributed / precision setup
     device_type = autodetect_device_type() if args.device_type == '' else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(
+        device_type, seed=args.seed, deterministic=args.deterministic
+    )
     # Load model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
     sequence_len = meta["model_config"]["sequence_len"]

@@ -10,6 +10,12 @@ from nanochat.checkpoint_manager import save_checkpoint
 def test_save_checkpoint_writes_evaluation_file(tmp_path):
     evaluation = {
         "checkpoint_step": 12,
+        "reproducibility": {
+            "seed": 42,
+            "deterministic_algorithms": True,
+            "cublas_workspace_config": ":4096:8",
+            "flash_attention_3_active": False,
+        },
         "training": {
             "total_time_seconds": 123.5,
             "total_flops": 1.0e15,

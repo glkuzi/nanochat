@@ -3,9 +3,14 @@ Common utilities for nanochat.
 """
 
 import os
+# Required by deterministic CUDA GEMM. It must be present before the first
+# cuBLAS workspace is created, so set it before importing torch.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import re
 import logging
+import random
 import urllib.request
+import numpy as np
 import torch
 import torch.distributed as dist
 from filelock import FileLock
@@ -67,6 +72,38 @@ def setup_default_logging():
 
 setup_default_logging()
 logger = logging.getLogger(__name__)
+
+DEFAULT_SEED = 42
+
+
+def configure_reproducibility(seed=DEFAULT_SEED, deterministic=True):
+    """Seed all RNGs and configure strict deterministic execution."""
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+
+    # PYTHONHASHSEED affects child processes created after this assignment.
+    # Nanochat itself does not use hash iteration for data/model ordering.
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.use_deterministic_algorithms(bool(deterministic), warn_only=False)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.allow_tf32 = not deterministic
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
+    torch.set_float32_matmul_precision("highest" if deterministic else "high")
+
+    logger.info(
+        "Reproducibility: seed=%d deterministic_algorithms=%s",
+        seed,
+        bool(deterministic),
+    )
 
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
@@ -171,7 +208,11 @@ def autodetect_device_type():
     print0(f"Autodetected device type: {device_type}")
     return device_type
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
+def compute_init(
+    device_type="cuda",
+    seed=DEFAULT_SEED,
+    deterministic=True,
+): # cuda|cpu|mps
     """Basic initialization that we keep doing over and over, so make common."""
 
     assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
@@ -180,18 +221,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
 
-    # Reproducibility
-    # Note that we set the global seeds here, but most of the code uses explicit rng objects.
-    # The only place where global rng might be used is nn.Module initialization of the model weights.
-    torch.manual_seed(42)
-    if device_type == "cuda":
-        torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
-
-    # Precision
-    if device_type == "cuda":
-        torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls, see https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    configure_reproducibility(seed=seed, deterministic=deterministic)
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()

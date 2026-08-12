@@ -373,6 +373,10 @@ class ARMTGPT(GPT):
                 controllers.append(nn.Identity())
         self.armt_layers = nn.ModuleList(controllers)
 
+        #print("#################### ARMT DEBUG ######################")
+        #print(self.wrap_layers)
+        #print(self.armt_layers)
+
         if config.freeze_mem:
             for layer_index, controller in enumerate(self.armt_layers):
                 if self.wrap_layers[layer_index]:

@@ -45,6 +45,8 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--seed", type=int, default=42, help="global Python/NumPy/PyTorch seed")
+parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=False, help="require deterministic algorithms (default: enabled)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -97,7 +99,9 @@ user_config = vars(args).copy()  # for logging
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(
+    device_type, seed=args.seed, deterministic=args.deterministic
+)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -114,13 +118,15 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
+from nanochat.flash_attention import is_fa3_active
+using_fa3 = is_fa3_active()
 if using_fa3:
     print0("✓ Using Flash Attention 3: efficient, new and awesome.")
 else:
     print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+    if args.deterministic and HAS_FA3:
+        print0("WARNING: Flash Attention 3 disabled for strict deterministic execution; using PyTorch SDPA")
+    elif HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
         print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
     else:
         print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
@@ -494,6 +500,7 @@ while True:
                 "core_metric": results["core_metric"],
             },
             "eval_time": results["eval_time"],
+            "seeds": results["seeds"],
             "max_per_task": args.core_metric_max_per_task,
         }
         wandb_run.log({
@@ -529,6 +536,7 @@ while True:
                 "overall": babilong_results["babilong_metric"],
             },
             "eval_time": babilong_results["eval_time"],
+            "seeds": babilong_results["seeds"],
             "example_counts": babilong_results["example_counts"],
             "tasks": babilong_results["tasks"],
             "lengths": babilong_results["lengths"],
@@ -584,6 +592,12 @@ while True:
         peak_memory_bytes = int(get_max_memory())
         evaluation_snapshot = {
             "checkpoint_step": step,
+            "reproducibility": {
+                "seed": args.seed,
+                "deterministic_algorithms": args.deterministic,
+                "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                "flash_attention_3_active": using_fa3,
+            },
             "training": {
                 "total_time_seconds": total_training_time,
                 "total_flops": flops_so_far,
