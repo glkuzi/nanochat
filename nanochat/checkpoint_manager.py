@@ -94,10 +94,19 @@ def build_model(checkpoint_dir, step, device, phase):
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
+    # ARMTGPTConfig is a strict extension of GPTConfig. Detect it from its
+    # serialized architecture fields so existing checkpoint/evaluation entry
+    # points can load either model without a separate checkpoint format.
+    if "num_mem_tokens" in model_config_kwargs:
+        from nanochat.armt import ARMTGPT, ARMTGPTConfig
+        model_config = ARMTGPTConfig(**model_config_kwargs)
+        model_cls = ARMTGPT
+    else:
+        model_config = GPTConfig(**model_config_kwargs)
+        model_cls = GPT
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = model_cls(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
