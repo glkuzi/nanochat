@@ -258,37 +258,37 @@ def _generate_armt_completions(
     prompt_tokens: Sequence[list[int]],
     max_new_tokens: int,
 ) -> list[str]:
-    """Batch ARMT prompts with equal lengths without padding their context."""
+    """Generate a true mixed-length batch through ARMT's padded forward path."""
     raw_model = getattr(model, "_orig_mod", model)
     device = raw_model.get_device()
     assistant_end, bos = _terminal_token_ids(tokenizer)
-    generated = [None] * len(prompt_tokens)
-    groups: dict[int, list[int]] = defaultdict(list)
-    for row, tokens in enumerate(prompt_tokens):
-        groups[len(tokens)].append(row)
-
-    # ARMT recomputes full prefixes and has no padding mask. Exact-length
-    # bucketing therefore gives true batching while preserving model semantics.
-    for rows in groups.values():
-        ids = torch.tensor([prompt_tokens[row] for row in rows], dtype=torch.long, device=device)
-        group_generated = [[] for _ in rows]
-        finished = torch.zeros(len(rows), dtype=torch.bool, device=device)
-        for step in range(max_new_tokens):
-            logits = raw_model.forward(ids)[:, -1, :]
-            next_ids = torch.argmax(logits, dim=-1)
-            terminal = (next_ids == assistant_end) | (next_ids == bos)
-            active = ~finished
-            for group_row, token in enumerate(next_ids.tolist()):
-                if active[group_row].item() and not terminal[group_row].item():
-                    group_generated[group_row].append(token)
-            finished |= terminal
-            if finished.all() or step + 1 == max_new_tokens:
-                break
-            next_ids = torch.where(finished, torch.full_like(next_ids, bos), next_ids)
-            ids = torch.cat((ids, next_ids.unsqueeze(1)), dim=1)
-        for row, tokens in zip(rows, group_generated):
-            generated[row] = tokenizer.decode(tokens).strip()
-    return generated
+    sequences = [tokens.copy() for tokens in prompt_tokens]
+    generated = [[] for _ in prompt_tokens]
+    finished = torch.zeros(len(prompt_tokens), dtype=torch.bool, device=device)
+    for step in range(max_new_tokens):
+        lengths = torch.tensor([len(tokens) for tokens in sequences], device=device)
+        padded_width = int(lengths.max().item())
+        ids = torch.full(
+            (len(sequences), padded_width),
+            bos,
+            dtype=torch.long,
+            device=device,
+        )
+        for row, tokens in enumerate(sequences):
+            ids[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.long, device=device)
+        logits = raw_model.forward_padded(ids, lengths)
+        batch_rows = torch.arange(len(sequences), device=device)
+        next_ids = torch.argmax(logits[batch_rows, lengths - 1], dim=-1)
+        terminal = (next_ids == assistant_end) | (next_ids == bos)
+        active = ~finished
+        for row, token in enumerate(next_ids.tolist()):
+            if active[row].item() and not terminal[row].item():
+                sequences[row].append(token)
+                generated[row].append(token)
+        finished |= terminal
+        if finished.all() or step + 1 == max_new_tokens:
+            break
+    return [tokenizer.decode(tokens).strip() for tokens in generated]
 
 
 @torch.inference_mode()

@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, attention_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -106,8 +106,23 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            if attention_mask is None:
+                # Training: causal attention with optional sliding window
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                # Ragged ARMT batches require an explicit per-row padding mask.
+                # Flash Attention's dense API has no padding-mask argument, so
+                # use SDPA for this inference-only path.
+                q_sdpa = q.transpose(1, 2)
+                k_sdpa = k.transpose(1, 2)
+                v_sdpa = v.transpose(1, 2)
+                y = F.scaled_dot_product_attention(
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
+                    attn_mask=attention_mask,
+                    enable_gqa=q_sdpa.size(1) != k_sdpa.size(1),
+                ).transpose(1, 2)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -147,8 +162,10 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, attention_mask=None):
+        x = x + self.attn(
+            norm(x), ve, cos_sin, window_size, kv_cache, attention_mask=attention_mask
+        )
         x = x + self.mlp(norm(x))
         return x
 

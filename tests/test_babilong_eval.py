@@ -6,9 +6,52 @@ from nanochat.babilong_eval import (
     aggregate_babilong_scores,
     answer_in_completion,
     evaluate_babilong,
+    generate_babilong_completions,
     parse_babilong_lengths,
     parse_babilong_tasks,
 )
+
+
+def test_armt_generation_uses_one_mixed_length_batch():
+    class Tokenizer:
+        def get_bos_token_id(self):
+            return 15
+
+        def encode_special(self, token):
+            assert token == "<|assistant_end|>"
+            return 14
+
+        def __call__(self, prompt, prepend=None):
+            return [prepend] + list(range(1, len(prompt) + 1))
+
+        def decode(self, tokens):
+            return ",".join(map(str, tokens))
+
+    class MockARMT:
+        armt_layers = ()
+
+        def __init__(self):
+            self.batch_shapes = []
+
+        def get_device(self):
+            return torch.device("cpu")
+
+        def forward_padded(self, ids, sequence_lengths):
+            self.batch_shapes.append((tuple(ids.shape), sequence_lengths.tolist()))
+            logits = torch.zeros(*ids.shape, 16)
+            logits[..., 14] = 1
+            return logits
+
+    model = MockARMT()
+    completions = generate_babilong_completions(
+        model,
+        Tokenizer(),
+        ["a", "abcd", "ab"],
+        max_new_tokens=10,
+    )
+
+    assert completions == ["", "", ""]
+    assert model.batch_shapes == [((3, 5), [2, 5, 3])]
 
 
 def test_selection_ranges_and_defaults():

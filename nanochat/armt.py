@@ -252,6 +252,79 @@ class AssociativeMemoryController(nn.Module):
             output = output + anchor.to(output.dtype) * 0
         return output
 
+    def forward_ragged(
+        self,
+        block,
+        x,
+        ve,
+        cos_sin,
+        window_size,
+        segment_lengths,
+        valid_mask,
+    ):
+        """Run fixed-width padded segments while preserving per-row ARMT state."""
+        extra_tokens = self.num_mem_tokens + int(self.use_sink)
+        chunk_size = self.segment_size + extra_tokens
+        x_chunks = x.split(chunk_size, dim=1)
+        ve_chunks = [None] * len(x_chunks) if ve is None else ve.split(chunk_size, dim=1)
+        cos_chunks = cos_sin[0].split(chunk_size, dim=1)
+        sin_chunks = cos_sin[1].split(chunk_size, dim=1)
+        mask_chunks = valid_mask.split(chunk_size, dim=1)
+
+        W_mem, z = self._initial_memory(x.size(0), x.device)
+        outputs = []
+        local_positions = torch.arange(chunk_size, device=x.device)
+        causal = local_positions.view(1, -1, 1) >= local_positions.view(1, 1, -1)
+        window = window_size[0]
+        if window >= 0:
+            causal &= (
+                local_positions.view(1, -1, 1) - local_positions.view(1, 1, -1)
+            ) <= window
+
+        for segment_index, (x_seg, ve_seg, cos_seg, sin_seg, valid_seg) in enumerate(
+            zip(x_chunks, ve_chunks, cos_chunks, sin_chunks, mask_chunks)
+        ):
+            active = segment_lengths[:, segment_index] > 0
+            if segment_index > 0:
+                association = self._associate(x_seg, W_mem, z)
+                x_seg = x_seg + association * active[:, None, None]
+            attention_mask = (
+                causal[:, : x_seg.size(1), : x_seg.size(1)]
+                & valid_seg[:, None, :, None]
+                & valid_seg[:, None, None, :]
+            )
+            seg_out = block(
+                x_seg,
+                ve_seg,
+                (cos_seg, sin_seg),
+                window_size,
+                kv_cache=None,
+                attention_mask=attention_mask,
+            )
+
+            memory_start = int(self.use_sink) + segment_lengths[:, segment_index]
+            memory_offsets = torch.arange(self.num_mem_tokens, device=x.device)
+            memory_indices = memory_start[:, None] + memory_offsets[None, :]
+            mem_out = seg_out.gather(
+                1, memory_indices[:, :, None].expand(-1, -1, seg_out.size(-1))
+            )
+            new_W_mem, new_z = self._update(
+                mem_out, W_mem, z, first_segment=segment_index == 0
+            )
+            W_mem = torch.where(active[:, None, None, None], new_W_mem, W_mem)
+            if z is not None:
+                z = torch.where(active[:, None, None], new_z, z)
+            outputs.append(seg_out)
+
+        output = torch.cat(outputs, dim=1)
+        if len(outputs) == 1:
+            anchor = sum(
+                (parameter.sum() for parameter in self.parameters()),
+                output.new_zeros(()),
+            )
+            output = output + anchor.to(output.dtype) * 0
+        return output
+
 
 class ARMTGPT(GPT):
     """nanochat GPT with per-layer inner-loop associative memory.
@@ -359,6 +432,221 @@ class ARMTGPT(GPT):
         for segment in hidden_states.split(chunk_size, dim=1):
             cleaned.append(segment[:, int(self.config.use_sink) : -self.config.num_mem_tokens, :])
         return torch.cat(cleaned, dim=1)
+
+    def _padded_layout(self, sequence_lengths: torch.Tensor):
+        """Build the physical layout and RoPE positions for a ragged ARMT batch."""
+        batch_size = sequence_lengths.numel()
+        max_real_tokens = int(sequence_lengths.max().item())
+        num_segments = math.ceil(max_real_tokens / self.config.segment_size)
+        extra_tokens = self.config.num_mem_tokens + int(self.config.use_sink)
+        chunk_size = self.config.segment_size + extra_tokens
+        total_augmented = num_segments * chunk_size
+        starts = torch.arange(num_segments, device=sequence_lengths.device)
+        starts = starts * self.config.segment_size
+        segment_lengths = (
+            sequence_lengths[:, None] - starts[None, :]
+        ).clamp(min=0, max=self.config.segment_size)
+        valid_mask = torch.zeros(
+            batch_size,
+            total_augmented,
+            dtype=torch.bool,
+            device=sequence_lengths.device,
+        )
+        position_ids = torch.zeros(
+            batch_size,
+            total_augmented,
+            dtype=torch.long,
+            device=sequence_lengths.device,
+        )
+        for segment_index in range(num_segments):
+            chunk_start = segment_index * chunk_size
+            for row in range(batch_size):
+                real_length = int(segment_lengths[row, segment_index].item())
+                if real_length == 0:
+                    continue
+                valid_length = real_length + extra_tokens
+                valid_mask[row, chunk_start : chunk_start + valid_length] = True
+                position_start = (
+                    0
+                    if self.config.segment_position_mode == "reset"
+                    else chunk_start
+                )
+                position_ids[row, chunk_start : chunk_start + valid_length] = torch.arange(
+                    position_start,
+                    position_start + valid_length,
+                    device=sequence_lengths.device,
+                )
+        return segment_lengths, valid_mask, position_ids
+
+    def _augment_padded_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        segment_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, _, width = hidden_states.shape
+        num_segments = segment_lengths.size(1)
+        extra_tokens = self.config.num_mem_tokens + int(self.config.use_sink)
+        chunk_size = self.config.segment_size + extra_tokens
+        output = hidden_states.new_zeros(batch_size, num_segments * chunk_size, width)
+        memory = self.memory.to(hidden_states.dtype)
+        sink = None if self.sink is None else self.sink.to(hidden_states.dtype)
+        for segment_index in range(num_segments):
+            real_start = segment_index * self.config.segment_size
+            chunk_start = segment_index * chunk_size
+            for row in range(batch_size):
+                real_length = int(segment_lengths[row, segment_index].item())
+                if real_length == 0:
+                    continue
+                cursor = chunk_start
+                if sink is not None:
+                    output[row, cursor : cursor + 1] = sink
+                    cursor += 1
+                output[row, cursor : cursor + real_length] = hidden_states[
+                    row, real_start : real_start + real_length
+                ]
+                cursor += real_length
+                output[row, cursor : cursor + self.config.num_mem_tokens] = memory
+        return output
+
+    def _augment_padded_values(
+        self,
+        value_embeddings: torch.Tensor,
+        segment_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, _, width = value_embeddings.shape
+        num_segments = segment_lengths.size(1)
+        extra_tokens = self.config.num_mem_tokens + int(self.config.use_sink)
+        chunk_size = self.config.segment_size + extra_tokens
+        output = value_embeddings.new_zeros(batch_size, num_segments * chunk_size, width)
+        for segment_index in range(num_segments):
+            real_start = segment_index * self.config.segment_size
+            chunk_start = segment_index * chunk_size + int(self.config.use_sink)
+            for row in range(batch_size):
+                real_length = int(segment_lengths[row, segment_index].item())
+                if real_length:
+                    output[row, chunk_start : chunk_start + real_length] = value_embeddings[
+                        row, real_start : real_start + real_length
+                    ]
+        return output
+
+    def _clean_padded_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        segment_lengths: torch.Tensor,
+        max_real_tokens: int,
+    ) -> torch.Tensor:
+        batch_size, _, width = hidden_states.shape
+        extra_tokens = self.config.num_mem_tokens + int(self.config.use_sink)
+        chunk_size = self.config.segment_size + extra_tokens
+        output = hidden_states.new_zeros(batch_size, max_real_tokens, width)
+        for segment_index in range(segment_lengths.size(1)):
+            real_start = segment_index * self.config.segment_size
+            chunk_start = segment_index * chunk_size + int(self.config.use_sink)
+            for row in range(batch_size):
+                real_length = int(segment_lengths[row, segment_index].item())
+                if real_length:
+                    output[row, real_start : real_start + real_length] = hidden_states[
+                        row, chunk_start : chunk_start + real_length
+                    ]
+        return output
+
+    @staticmethod
+    def _padded_causal_mask(valid_mask: torch.Tensor, window_size):
+        total_length = valid_mask.size(1)
+        positions = torch.arange(total_length, device=valid_mask.device)
+        mask = positions.view(1, -1, 1) >= positions.view(1, 1, -1)
+        window = window_size[0]
+        if window >= 0:
+            mask &= (
+                positions.view(1, -1, 1) - positions.view(1, 1, -1)
+            ) <= window
+        return (
+            mask[:, None]
+            & valid_mask[:, None, :, None]
+            & valid_mask[:, None, None, :]
+        )
+
+    def forward_padded(
+        self,
+        idx: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inference forward for right-padded, mixed-length ARMT batches."""
+        if idx.ndim != 2:
+            raise ValueError(f"idx must have shape (batch, time), got {tuple(idx.shape)}")
+        if sequence_lengths.shape != (idx.size(0),):
+            raise ValueError("sequence_lengths must contain one value per batch row")
+        sequence_lengths = sequence_lengths.to(device=idx.device, dtype=torch.long)
+        if torch.any(sequence_lengths <= 0) or torch.any(sequence_lengths > idx.size(1)):
+            raise ValueError("sequence_lengths must be between 1 and the padded width")
+        if idx.device != self.cos.device:
+            raise ValueError("idx and rotary embeddings must be on the same device")
+
+        segment_lengths, valid_mask, position_ids = self._padded_layout(sequence_lengths)
+        max_position = int(position_ids.max().item()) + 1
+        if max_position > self.cos.size(1):
+            raise ValueError(
+                f"ARMT augmented position {max_position} exceeds RoPE cache size {self.cos.size(1)}"
+            )
+        x = norm(self.transformer.wte(idx).to(COMPUTE_DTYPE))
+        if idx.size(1) > 1:
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                self.smear_gate(x[:, 1:, :24])
+            )
+            x = torch.cat((x[:, :1], x[:, 1:] + gate * x[:, :-1]), dim=1)
+        x = self._augment_padded_hidden(x, segment_lengths)
+        rotary_shape = (*position_ids.shape, 1, self.cos.size(-1))
+        cos_sin = (
+            self.cos[0].index_select(0, position_ids.flatten()).view(rotary_shape),
+            self.sin[0].index_select(0, position_ids.flatten()).view(rotary_shape),
+        )
+
+        x0 = x
+        backout_layer = self.config.n_layer // 2
+        x_backout = None
+        for layer_index, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[layer_index] * x + self.x0_lambdas[layer_index] * x0
+            value_embeddings = None
+            if str(layer_index) in self.value_embeds:
+                values = self.value_embeds[str(layer_index)](idx).to(x.dtype)
+                value_embeddings = self._augment_padded_values(values, segment_lengths)
+            if self.wrap_layers[layer_index]:
+                x = self.armt_layers[layer_index].forward_ragged(
+                    block,
+                    x,
+                    value_embeddings,
+                    cos_sin,
+                    self.window_sizes[layer_index],
+                    segment_lengths,
+                    valid_mask,
+                )
+            else:
+                attention_mask = self._padded_causal_mask(
+                    valid_mask, self.window_sizes[layer_index]
+                )
+                x = block(
+                    x,
+                    value_embeddings,
+                    cos_sin,
+                    self.window_sizes[layer_index],
+                    kv_cache=None,
+                    attention_mask=attention_mask,
+                )
+            if layer_index == backout_layer:
+                x_backout = x
+
+        if x_backout is not None:
+            x = x - self.backout_lambda.to(x.dtype) * x_backout
+        x = self._clean_padded_hidden(
+            norm(x), segment_lengths, max_real_tokens=idx.size(1)
+        )
+        memory_anchor = self.memory.sum()
+        if self.sink is not None:
+            memory_anchor = memory_anchor + self.sink.sum()
+        x = x + memory_anchor.to(x.dtype) * 0
+        softcap = 15
+        logits = self.lm_head(x)[..., : self.config.vocab_size].float()
+        return softcap * torch.tanh(logits / softcap)
 
     def _armt_cos_sin(self, real_seq_len: int, device: torch.device):
         real_lengths = [

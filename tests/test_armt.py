@@ -88,3 +88,21 @@ def test_plain_gpt_weights_and_cache_fallback():
     full_logits = model(torch.cat((prompt, next_token), dim=1))
     torch.testing.assert_close(decode_logits[:, -1], full_logits[:, -1])
     assert cache.cache_seqlens.item() == 6
+
+
+def test_padded_mixed_length_forward_matches_independent_rows():
+    torch.manual_seed(4321)
+    model = _build_armt(sequence_len=16, use_sink=True)
+    lengths = torch.tensor([3, 7])
+    idx = torch.randint(0, model.config.vocab_size, (2, 7))
+
+    with torch.inference_mode():
+        batched_logits = model.forward_padded(idx, lengths)
+        for row, length in enumerate(lengths.tolist()):
+            independent_logits = model(idx[row : row + 1, :length])
+            torch.testing.assert_close(
+                batched_logits[row, :length],
+                independent_logits[0],
+                atol=1e-5,
+                rtol=1e-4,
+            )

@@ -81,10 +81,14 @@ parser.add_argument("--babilong-tasks", type=str, default="qa1-qa5", help="BABIL
 parser.add_argument("--babilong-lengths", type=str, default="0k-32k", help="BABILong lengths, e.g. 0k-32k or 0k,4k,32k")
 parser.add_argument("--babilong-max-per-task", type=int, default=-1, help="examples per BABILong task/length (-1 = all 100)")
 parser.add_argument("--babilong-max-new-tokens", type=int, default=20, choices=range(10, 31), metavar="N", help="BABILong greedy generation budget from 10 to 30 tokens")
-parser.add_argument("--babilong-batch-size", type=int, default=8, help="per-device BABILong generation batch size")
 parser.add_argument("--babilong-dataset", type=str, default="RMT-team/babilong", help="Hugging Face BABILong dataset repository")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# ARMT
+parser.add_argument("--num_mem_tokens", type=int, default=16, help="depth of the Transformer model")
+parser.add_argument("--d_mem", type=int, default=64, help="depth of the Transformer model")
+parser.add_argument("--segment_size", type=int, default=512, help="depth of the Transformer model")
+
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -155,7 +159,8 @@ def build_model_meta(depth, model_type):
         config = ARMTGPTConfig(
             sequence_len=args.max_seq_len, vocab_size=vocab_size,
             n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-            window_pattern=args.window_pattern,
+            window_pattern=args.window_pattern, num_mem_tokens=args.num_mem_tokens,
+            d_mem=args.d_mem, segment_size=args.segment_size,
         )
         with torch.device("meta"):
             model_meta = ARMTGPT(config)
@@ -414,6 +419,11 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    latest_evaluation = {
+        "validation": None,
+        "core": None,
+        "babilong": None,
+    }
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -421,6 +431,12 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    latest_evaluation = meta_data.get("evaluation", {})
+    latest_evaluation = {
+        "validation": latest_evaluation.get("validation"),
+        "core": latest_evaluation.get("core"),
+        "babilong": latest_evaluation.get("babilong"),
+    }
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -446,6 +462,13 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
+        latest_evaluation["validation"] = {
+            "evaluated_at_step": step,
+            "scores": {
+                "bpb": val_bpb,
+                "minimum_bpb": min_val_bpb,
+            },
+        }
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -463,6 +486,15 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        latest_evaluation["core"] = {
+            "evaluated_at_step": step,
+            "per_task_scores": results["results"],
+            "per_task_centered_scores": results["centered_results"],
+            "aggregated_scores": {
+                "core_metric": results["core_metric"],
+            },
+            "max_per_task": args.core_metric_max_per_task,
+        }
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -484,10 +516,25 @@ while True:
                 lengths=args.babilong_lengths,
                 max_per_task=args.babilong_max_per_task,
                 max_new_tokens=args.babilong_max_new_tokens,
-                batch_size=args.babilong_batch_size,
                 dataset_name=args.babilong_dataset,
             )
         print0(f"Step {step:05d} | BABILong metric: {babilong_results['babilong_metric']:.4f}")
+        latest_evaluation["babilong"] = {
+            "evaluated_at_step": step,
+            "per_task_per_length_scores": babilong_results["results"],
+            "aggregated_scores": {
+                "per_task": babilong_results["task_results"],
+                "per_length": babilong_results["length_results"],
+                "overall": babilong_results["babilong_metric"],
+            },
+            "example_counts": babilong_results["example_counts"],
+            "tasks": babilong_results["tasks"],
+            "lengths": babilong_results["lengths"],
+            "batch_size": babilong_results["batch_size"],
+            "max_per_task": args.babilong_max_per_task,
+            "max_new_tokens": args.babilong_max_new_tokens,
+            "dataset": args.babilong_dataset,
+        }
         babilong_log = {
             f"babilong/{task}/{length}": score
             for task, length_scores in babilong_results["results"].items()
@@ -532,6 +579,12 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        evaluation_snapshot = {
+            "checkpoint_step": step,
+            "validation": latest_evaluation["validation"],
+            "core": latest_evaluation["core"],
+            "babilong": latest_evaluation["babilong"],
+        }
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -545,6 +598,7 @@ while True:
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
+                "evaluation": evaluation_snapshot,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -553,6 +607,7 @@ while True:
                 },
             },
             rank=ddp_rank,
+            eval_data=evaluation_snapshot,
         )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
