@@ -114,6 +114,17 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
     assert result["example_counts"]["qa1"]["0k"] == 10
     assert result["batch_size"] == 8
     assert observed_batch_sizes == [8, 2] * 4
+    timing = result["eval_time"]
+    assert set(timing["per_task_per_length_seconds"]) == {"qa1", "qa2"}
+    assert set(timing["per_task_seconds"]) == {"qa1", "qa2"}
+    assert set(timing["per_length_seconds"]) == {"0k", "1k"}
+    assert all(value >= 0 for value in timing["per_task_seconds"].values())
+    assert timing["total_seconds"] == sum(timing["per_task_seconds"].values())
+    for length in ("0k", "1k"):
+        assert timing["per_length_seconds"][length] == sum(
+            timing["per_task_per_length_seconds"][task][length]
+            for task in ("qa1", "qa2")
+        )
 
 
 def test_evaluate_babilong_rejects_invalid_batch_size():

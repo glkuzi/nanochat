@@ -91,6 +91,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     # Evaluate each task
     results = {}
     centered_results = {}
+    task_eval_seconds = {}
     for task in tasks:
         start_time = time.time()
         label = task['label']
@@ -118,13 +119,18 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
         elapsed = time.time() - start_time
+        task_eval_seconds[label] = elapsed
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
     out = {
         "results": results,
         "centered_results": centered_results,
-        "core_metric": core_metric
+        "core_metric": core_metric,
+        "eval_time": {
+            "per_task_seconds": task_eval_seconds,
+            "total_seconds": sum(task_eval_seconds.values()),
+        },
     }
     return out
 

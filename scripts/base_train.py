@@ -493,6 +493,7 @@ while True:
             "aggregated_scores": {
                 "core_metric": results["core_metric"],
             },
+            "eval_time": results["eval_time"],
             "max_per_task": args.core_metric_max_per_task,
         }
         wandb_run.log({
@@ -527,6 +528,7 @@ while True:
                 "per_length": babilong_results["length_results"],
                 "overall": babilong_results["babilong_metric"],
             },
+            "eval_time": babilong_results["eval_time"],
             "example_counts": babilong_results["example_counts"],
             "tasks": babilong_results["tasks"],
             "lengths": babilong_results["lengths"],
@@ -579,8 +581,15 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        peak_memory_bytes = int(get_max_memory())
         evaluation_snapshot = {
             "checkpoint_step": step,
+            "training": {
+                "total_time_seconds": total_training_time,
+                "total_flops": flops_so_far,
+                "peak_memory_bytes": peak_memory_bytes,
+                "peak_memory_mib": peak_memory_bytes / (1024 * 1024),
+            },
             "validation": latest_evaluation["validation"],
             "core": latest_evaluation["core"],
             "babilong": latest_evaluation["babilong"],

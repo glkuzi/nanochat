@@ -359,6 +359,7 @@ def evaluate_babilong(
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     results = {task: {} for task in selected_tasks}
     example_counts = {task: {} for task in selected_tasks}
+    cell_eval_seconds = {task: {} for task in selected_tasks}
 
     for length in selected_lengths:
         for task in selected_tasks:
@@ -405,13 +406,23 @@ def evaluate_babilong(
             accuracy = correct_count / evaluated_count
             results[task][length] = accuracy
             example_counts[task][length] = int(evaluated_count)
+            elapsed = time.time() - started
+            cell_eval_seconds[task][length] = elapsed
             print0(
                 f"accuracy: {accuracy:.4f} "
                 f"({int(correct_count)}/{int(evaluated_count)}) | "
-                f"time: {time.time() - started:.2f}s"
+                f"time: {elapsed:.2f}s"
             )
 
     aggregates = aggregate_babilong_scores(results)
+    task_eval_seconds = {
+        task: sum(length_times.values())
+        for task, length_times in cell_eval_seconds.items()
+    }
+    length_eval_seconds = {
+        length: sum(cell_eval_seconds[task][length] for task in selected_tasks)
+        for length in selected_lengths
+    }
     return {
         "results": results,
         "task_results": aggregates["task_results"],
@@ -421,6 +432,12 @@ def evaluate_babilong(
         "tasks": list(selected_tasks),
         "lengths": list(selected_lengths),
         "batch_size": batch_size,
+        "eval_time": {
+            "per_task_per_length_seconds": cell_eval_seconds,
+            "per_task_seconds": task_eval_seconds,
+            "per_length_seconds": length_eval_seconds,
+            "total_seconds": sum(task_eval_seconds.values()),
+        },
     }
 
 
