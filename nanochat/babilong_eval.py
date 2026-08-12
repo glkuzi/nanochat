@@ -25,8 +25,12 @@ BABILONG_LENGTHS = (
     "0k", "1k", "2k", "4k", "8k", "16k", "32k",
     "128k", "256k", "512k", "1M",
 )
+BABILONG_LENGTHS_TRAIN = (
+    "0k", "2k", "4k", "8k", "16k", "32k",
+)
 DEFAULT_BABILONG_TASKS = BABILONG_TASKS[:5]
 DEFAULT_BABILONG_LENGTHS = BABILONG_LENGTHS[:7]
+DEFAULT_BABILONG_LENGTHS_TRAIN = BABILONG_LENGTHS_TRAIN[:7]
 DEFAULT_BABILONG_BATCH_SIZE = 8
 BABILONG_SUBSAMPLE_SEED = 1337
 
@@ -83,6 +87,10 @@ def parse_babilong_tasks(value: str | Sequence[str] | None = None) -> tuple[str,
 
 def parse_babilong_lengths(value: str | Sequence[str] | None = None) -> tuple[str, ...]:
     return parse_babilong_selection(value, BABILONG_LENGTHS, DEFAULT_BABILONG_LENGTHS, "length")
+
+
+def parse_babilong_lengths_train(value: str | Sequence[str] | None = None) -> tuple[str, ...]:
+    return parse_babilong_selection(value, BABILONG_LENGTHS_TRAIN, DEFAULT_BABILONG_LENGTHS_TRAIN, "length")
 
 
 def format_babilong_prompt(sample: dict, task: str) -> str:
@@ -449,12 +457,14 @@ __all__ = [
     "BABILONG_DATASET",
     "BABILONG_TASKS",
     "BABILONG_LENGTHS",
+    "BABILONG_LENGTHS_TRAIN",
     "DEFAULT_BABILONG_TASKS",
     "DEFAULT_BABILONG_LENGTHS",
     "DEFAULT_BABILONG_BATCH_SIZE",
     "BABILONG_SUBSAMPLE_SEED",
     "parse_babilong_tasks",
     "parse_babilong_lengths",
+    "parse_babilong_lengths_train",
     "format_babilong_prompt",
     "answer_in_completion",
     "aggregate_babilong_scores",

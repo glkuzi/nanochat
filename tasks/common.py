@@ -8,6 +8,9 @@ Example tasks: MMLU, ARC-Easy, ARC-Challenge, GSM8K, HumanEval, SmolTalk.
 import os
 import json
 import random
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 import numpy as np
@@ -16,6 +19,125 @@ import pyarrow.parquet as pq
 from filelock import FileLock
 
 from nanochat.common import get_base_dir
+
+_HUB_REQUEST_TIMEOUT = 60
+_HUB_MAX_ATTEMPTS = 5
+_HUB_RETRYABLE_HTTP_CODES = {400, 403, 408, 409, 425, 429, 500, 502, 503, 504}
+_HUB_USER_AGENT = "nanochat/1.0"
+
+
+def _urlopen(url):
+    request = urllib.request.Request(url, headers={"User-Agent": _HUB_USER_AGENT})
+    return urllib.request.urlopen(request, timeout=_HUB_REQUEST_TIMEOUT)
+
+
+def _is_retryable_download_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in _HUB_RETRYABLE_HTTP_CODES
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, OSError, pa.ArrowInvalid))
+
+
+def _retry_delay(attempt):
+    # Short exponential backoff. In particular, HF occasionally returns a transient
+    # 400 while its parquet service is resolving or refreshing an export.
+    time.sleep(min(2 ** attempt, 8))
+
+
+def _read_json(url):
+    with _urlopen(url) as response:
+        return json.loads(response.read())
+
+
+def _list_parquet_shards(repo_id, subset, split):
+    """List one Hub dataset cell, preferring stable resolve URLs from datasets-server."""
+    query = urllib.parse.urlencode({"dataset": repo_id, "config": subset})
+    datasets_server_url = f"https://datasets-server.huggingface.co/parquet?{query}"
+    quoted_repo = urllib.parse.quote(repo_id, safe="/")
+    quoted_subset = urllib.parse.quote(subset, safe="")
+    quoted_split = urllib.parse.quote(split, safe="")
+    hub_url = f"https://huggingface.co/api/datasets/{quoted_repo}/parquet/{quoted_subset}/{quoted_split}"
+
+    def parse_datasets_server(payload):
+        if not isinstance(payload, dict):
+            return []
+        return [
+            item["url"] for item in payload.get("parquet_files", [])
+            if item.get("config") == subset and item.get("split") == split
+        ]
+
+    errors = []
+    for attempt in range(_HUB_MAX_ATTEMPTS):
+        # The datasets-server response may contain every split in a config even when
+        # a split query parameter is supplied, so always filter it ourselves.
+        for endpoint, parser in (
+            (datasets_server_url, parse_datasets_server),
+            (hub_url, lambda payload: payload if isinstance(payload, list) else []),
+        ):
+            try:
+                shard_urls = parser(_read_json(endpoint))
+                if shard_urls:
+                    return shard_urls
+                errors.append(f"{endpoint}: no parquet files for config={subset!r}, split={split!r}")
+            except Exception as error:
+                errors.append(f"{endpoint}: {error}")
+        if attempt + 1 < _HUB_MAX_ATTEMPTS:
+            _retry_delay(attempt)
+
+    details = "; ".join(errors[-4:])
+    raise RuntimeError(
+        f"Unable to list parquet shards for {repo_id}/{subset}/{split} after "
+        f"{_HUB_MAX_ATTEMPTS} attempts. Last errors: {details}"
+    )
+
+
+def _valid_parquet(path):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        pq.ParquetFile(path)
+    except (OSError, pa.ArrowInvalid):
+        return False
+    return True
+
+
+def _download_parquet(shard_url, destination):
+    """Stream a shard to an atomic temporary file and retry transient failures."""
+    partial_path = destination + ".partial"
+    last_error = None
+    for attempt in range(_HUB_MAX_ATTEMPTS):
+        try:
+            with _urlopen(shard_url) as response, open(partial_path, "wb") as output:
+                while chunk := response.read(1024 * 1024):
+                    output.write(chunk)
+            # Do not publish an HTML error body or a truncated response as a shard.
+            if not _valid_parquet(partial_path):
+                raise pa.ArrowInvalid(f"Downloaded file is not valid parquet: {shard_url}")
+            os.replace(partial_path, destination)
+            return
+        except Exception as error:
+            if not _is_retryable_download_error(error):
+                raise
+            last_error = error
+            if attempt + 1 < _HUB_MAX_ATTEMPTS:
+                _retry_delay(attempt)
+    raise RuntimeError(
+        f"Unable to download parquet shard {shard_url} after {_HUB_MAX_ATTEMPTS} attempts"
+    ) from last_error
+
+
+def _read_valid_manifest(manifest_path, shards_dir):
+    try:
+        with open(manifest_path, "r") as f:
+            filenames = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(filenames, list) or not filenames:
+        return None
+    if not all(isinstance(name, str) and os.path.basename(name) == name for name in filenames):
+        return None
+    if not all(_valid_parquet(os.path.join(shards_dir, name)) for name in filenames):
+        return None
+    return filenames
 
 
 class HubDataset:
@@ -52,30 +174,30 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     base_dir = get_base_dir()
     slug = repo_id.replace("/", "--")
     shards_dir = os.path.join(base_dir, "task_data", slug, subset, split)
-    # the manifest is written last, so its existence means the download completed
+    # The manifest is written last. Validate it as well, so a corrupt cache repairs
+    # itself rather than failing every subsequent training run.
     manifest_path = os.path.join(shards_dir, "manifest.json")
-    if not os.path.exists(manifest_path):
+    filenames = _read_valid_manifest(manifest_path, shards_dir)
+    if filenames is None:
         os.makedirs(shards_dir, exist_ok=True)
         with FileLock(manifest_path + ".lock"):
             # only a single rank acquires the lock and downloads, the others block
             # here and then skip the download because they recheck the manifest
-            if not os.path.exists(manifest_path):
-                listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
-                with urllib.request.urlopen(listing_url) as response:
-                    shard_urls = json.loads(response.read())
+            filenames = _read_valid_manifest(manifest_path, shards_dir)
+            if filenames is None:
+                shard_urls = _list_parquet_shards(repo_id, subset, split)
                 filenames = []
                 for shard_index, shard_url in enumerate(shard_urls):
                     filename = f"{shard_index:05d}.parquet"
-                    print(f"Downloading {shard_url} ...")
-                    with urllib.request.urlopen(shard_url) as response:
-                        content = response.read()
-                    with open(os.path.join(shards_dir, filename), "wb") as f:
-                        f.write(content)
+                    shard_path = os.path.join(shards_dir, filename)
+                    if not _valid_parquet(shard_path):
+                        print(f"Downloading {shard_url} ...")
+                        _download_parquet(shard_url, shard_path)
                     filenames.append(filename)
-                with open(manifest_path, "w") as f:
+                partial_manifest = manifest_path + ".partial"
+                with open(partial_manifest, "w") as f:
                     json.dump(filenames, f)
-    with open(manifest_path, "r") as f:
-        filenames = json.load(f)
+                os.replace(partial_manifest, manifest_path)
     shard_paths = [os.path.join(shards_dir, filename) for filename in filenames]
     tables = [pq.read_table(path) for path in shard_paths]
     table = pa.concat_tables(tables)

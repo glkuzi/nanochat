@@ -83,6 +83,55 @@ A few more notes:
 - If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
 - Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
 
+### BABILong training
+
+`scripts.babilong_train` trains either GPT or ARMTGPT with answer-only loss on
+`RMT-team/babilong-train-5k-samples`. It supports fresh initialization and
+finetuning a nanochat checkpoint. The default mixture is `qa1-qa5` at `0k-8k`;
+use `--tasks` and `--lengths` to change it. Training cells are loaded and cached
+with Hugging Face `datasets`; use `--dataset-cache-dir` to override the default
+cache under `NANOCHAT_BASE_DIR`.
+
+Train from scratch:
+
+```bash
+python -m scripts.babilong_train \
+    --mode scratch --model-type armt \
+    --depth 4 --max-seq-len 8192 \
+    --output-model-tag armt_d4_babilong_scratch
+```
+
+Finetune a pretrained model:
+
+```bash
+# Keep the checkpoint as GPT.
+python -m scripts.babilong_train \
+    --mode finetune --model-type gpt \
+    --input-model-tag gpt_d4_with_bl \
+    --output-model-tag gpt_d4_babilong
+
+# Or initialize ARMT around the pretrained GPT and finetune the complete model.
+python -m scripts.babilong_train \
+    --mode finetune --model-type armt \
+    --input-model-tag gpt_d4_with_bl \
+    --num-mem-tokens 16 --d-mem 64 --segment-size 512 \
+    --output-model-tag armt_d4_babilong
+```
+
+Outputs are standard nanochat base checkpoints, so they can be evaluated with
+`python -m scripts.base_eval --model-tag <output-model-tag>`. Training data is
+cached through Hugging Face `datasets`. A batch contains examples from all
+selected tasks when the device batch size is at least the number of tasks; with
+smaller batches, tasks are interleaved evenly across consecutive batches. Each
+batch contains only one context length, and `--cell-batches` controls how often
+the active length rotates.
+
+Held-out answer loss runs every `--eval-every` steps. CORE and generative
+BABILong run every `--core-metric-every` and `--babilong-eval-every` steps; all
+enabled evaluations also run after the final training step. Their per-task and
+aggregated scores, timings, seeds, training time, and peak memory are saved in
+`eval_<step>.json` beside each checkpoint.
+
 ## Research
 
 If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:

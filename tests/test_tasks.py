@@ -1,13 +1,19 @@
 """
 Test the Task container machinery: slicing views, mixtures, and the
-HubDataset parquet wrapper (in-memory, no network).
+HubDataset parquet wrapper and resilient Hub parquet loading.
 
 python -m pytest tests/test_tasks.py -v
 """
 
+import io
+import json
+import urllib.error
+
 import numpy as np
 import pyarrow as pa
-from tasks.common import Task, TaskMixture, HubDataset, render_mc
+import pyarrow.parquet as pq
+import tasks.common as common
+from tasks.common import Task, TaskMixture, HubDataset, load_hub_dataset, render_mc
 
 
 class ToyTask(Task):
@@ -79,6 +85,73 @@ def test_hub_dataset_shuffle_matches_numpy():
     assert [ds[i]["x"] for i in range(100)] == [int(p) for p in perm]
     # shuffling returns a view; the original order is untouched
     assert HubDataset(table)[0] == {"x": 0}
+
+
+def _parquet_bytes(table):
+    output = pa.BufferOutputStream()
+    pq.write_table(table, output)
+    return output.getvalue().to_pybytes()
+
+
+def test_load_hub_dataset_falls_back_after_transient_400(tmp_path, monkeypatch):
+    table_bytes = _parquet_bytes(pa.table({"x": [1, 2], "answer": ["a", "b"]}))
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        url = request.full_url
+        calls.append(url)
+        if "datasets-server.huggingface.co" in url:
+            raise urllib.error.HTTPError(url, 400, "temporary", {}, None)
+        if url.endswith("/parquet/8k/qa1"):
+            return io.BytesIO(json.dumps(["https://example.test/shard.parquet"]).encode())
+        if url == "https://example.test/shard.parquet":
+            return io.BytesIO(table_bytes)
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(common, "get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(common.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(common.time, "sleep", lambda _seconds: None)
+
+    dataset = load_hub_dataset("RMT-team/babilong-train-5k-samples", "8k", "qa1")
+    assert len(dataset) == 2
+    assert dataset[1] == {"x": 2, "answer": "b"}
+    assert "datasets-server.huggingface.co" in calls[0]
+    assert any(url.endswith("/parquet/8k/qa1") for url in calls)
+
+
+def test_load_hub_dataset_filters_datasets_server_response(tmp_path, monkeypatch):
+    table_bytes = _parquet_bytes(pa.table({"x": [7]}))
+    listing = {
+        "parquet_files": [
+            {"config": "8k", "split": "qa2", "url": "https://example.test/wrong.parquet"},
+            {"config": "8k", "split": "qa1", "url": "https://example.test/right.parquet"},
+        ]
+    }
+    download_attempts = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal download_attempts
+        url = request.full_url
+        if "datasets-server.huggingface.co" in url:
+            return io.BytesIO(json.dumps(listing).encode())
+        if url == "https://example.test/right.parquet":
+            download_attempts += 1
+            if download_attempts == 1:
+                raise urllib.error.HTTPError(url, 400, "temporary", {}, None)
+            return io.BytesIO(table_bytes)
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(common, "get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(common.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(common.time, "sleep", lambda _seconds: None)
+
+    dataset = load_hub_dataset("RMT-team/babilong-train-5k-samples", "8k", "qa1")
+    assert dataset[0] == {"x": 7}
+    assert download_attempts == 2
+
+    # A second load uses the validated local manifest and makes no network calls.
+    monkeypatch.setattr(common.urllib.request, "urlopen", lambda *_args, **_kwargs: 1 / 0)
+    assert load_hub_dataset("RMT-team/babilong-train-5k-samples", "8k", "qa1")[0] == {"x": 7}
 
 
 def test_render_mc_letter_binding():
