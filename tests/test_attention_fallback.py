@@ -333,6 +333,51 @@ class TestSDPAOnly:
         assert cache.get_pos() == T_prefill + 1
         set_impl(None)
 
+    def test_kvcache_mixed_row_lengths(self):
+        """Mixed-length rows match independent single-row SDPA decoding."""
+        set_impl('sdpa')
+        B, T_max, H, D = 2, 8, 2, 4
+        positions = torch.tensor([2, 5], device=self.DEVICE, dtype=torch.int32)
+        base_k = torch.randn(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        base_v = torch.randn(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        batched_k = base_k.clone()
+        batched_v = base_v.clone()
+        batched = flash_attn.flash_attn_with_kvcache(
+            q, batched_k, batched_v, k=k, v=v,
+            cache_seqlens=positions,
+            causal=True, window_size=(-1, 0),
+        )
+
+        independent = []
+        for row, position in enumerate(positions.tolist()):
+            row_k = base_k[row : row + 1].clone()
+            row_v = base_v[row : row + 1].clone()
+            independent.append(
+                flash_attn.flash_attn_with_kvcache(
+                    q[row : row + 1], row_k, row_v,
+                    k=k[row : row + 1], v=v[row : row + 1],
+                    cache_seqlens=torch.tensor(
+                        [position], device=self.DEVICE, dtype=torch.int32
+                    ),
+                    causal=True, window_size=(-1, 0),
+                )
+            )
+            torch.testing.assert_close(batched_k[row, position], k[row, 0])
+            torch.testing.assert_close(batched_v[row, position], v[row, 0])
+
+        assert_close(
+            batched,
+            torch.cat(independent, dim=0),
+            "mixed-length KV cache",
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        set_impl(None)
+
 
 # =============================================================================
 # Override mechanism tests

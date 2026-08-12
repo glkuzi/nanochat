@@ -81,6 +81,7 @@ parser.add_argument("--babilong-tasks", type=str, default="qa1-qa5", help="BABIL
 parser.add_argument("--babilong-lengths", type=str, default="0k-32k", help="BABILong lengths, e.g. 0k-32k or 0k,4k,32k")
 parser.add_argument("--babilong-max-per-task", type=int, default=-1, help="examples per BABILong task/length (-1 = all 100)")
 parser.add_argument("--babilong-max-new-tokens", type=int, default=20, choices=range(10, 31), metavar="N", help="BABILong greedy generation budget from 10 to 30 tokens")
+parser.add_argument("--babilong-batch-size", type=int, default=8, help="per-device BABILong generation batch size")
 parser.add_argument("--babilong-dataset", type=str, default="RMT-team/babilong", help="Hugging Face BABILong dataset repository")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
@@ -483,6 +484,7 @@ while True:
                 lengths=args.babilong_lengths,
                 max_per_task=args.babilong_max_per_task,
                 max_new_tokens=args.babilong_max_new_tokens,
+                batch_size=args.babilong_batch_size,
                 dataset_name=args.babilong_dataset,
             )
         print0(f"Step {step:05d} | BABILong metric: {babilong_results['babilong_metric']:.4f}")

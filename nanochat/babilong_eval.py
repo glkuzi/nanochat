@@ -5,13 +5,14 @@ from __future__ import annotations
 import math
 import random
 import time
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 
 import torch
 import torch.distributed as dist
 
-from nanochat.common import print0
-from nanochat.engine import Engine
+from nanochat.common import COMPUTE_DTYPE, print0
+from nanochat.engine import KVCache
 from tasks.common import load_hub_dataset
 
 
@@ -26,6 +27,7 @@ BABILONG_LENGTHS = (
 )
 DEFAULT_BABILONG_TASKS = BABILONG_TASKS[:5]
 DEFAULT_BABILONG_LENGTHS = BABILONG_LENGTHS[:7]
+DEFAULT_BABILONG_BATCH_SIZE = 8
 
 
 _TASK_INSTRUCTIONS = {
@@ -160,40 +162,168 @@ def _ensure_rotary_capacity(model, real_tokens: int) -> None:
     print0(f"Extended rotary cache to {new_size:,} positions for BABILong")
 
 
+def _terminal_token_ids(tokenizer) -> tuple[int, int]:
+    return tokenizer.encode_special("<|assistant_end|>"), tokenizer.get_bos_token_id()
+
+
 @torch.inference_mode()
+def _generate_gpt_completions(
+    model,
+    tokenizer,
+    prompt_tokens: Sequence[list[int]],
+    max_new_tokens: int,
+) -> list[str]:
+    """Prefill variable-length prompts separately, then decode them as one batch."""
+    batch_size = len(prompt_tokens)
+    raw_model = getattr(model, "_orig_mod", model)
+    device = raw_model.get_device()
+    config = raw_model.config
+    kv_kwargs = {
+        "num_heads": config.n_kv_head,
+        "head_dim": config.n_embd // config.n_head,
+        "num_layers": config.n_layer,
+    }
+    max_cache_len = max(map(len, prompt_tokens)) + max_new_tokens
+    batch_cache = KVCache(
+        batch_size=batch_size,
+        seq_len=max_cache_len,
+        device=device,
+        dtype=COMPUTE_DTYPE,
+        **kv_kwargs,
+    )
+
+    next_logits = [None] * batch_size
+    previous_embeddings = [None] * batch_size
+    groups: dict[int, list[int]] = defaultdict(list)
+    for row, tokens in enumerate(prompt_tokens):
+        groups[len(tokens)].append(row)
+
+    # Prefill equal-length rows together. Uneven rows cannot be padded because
+    # nanochat GPT has no padding mask, but all rows share one cache for decode.
+    for rows in groups.values():
+        prompt_length = len(prompt_tokens[rows[0]])
+        prefill_cache = KVCache(
+            batch_size=len(rows),
+            seq_len=prompt_length,
+            device=device,
+            dtype=COMPUTE_DTYPE,
+            **kv_kwargs,
+        )
+        ids = torch.tensor(
+            [prompt_tokens[row] for row in rows], dtype=torch.long, device=device
+        )
+        logits = raw_model.forward(ids, kv_cache=prefill_cache)
+        length = prefill_cache.get_pos()
+        for group_row, row in enumerate(rows):
+            next_logits[row] = logits[group_row : group_row + 1, -1, :]
+            batch_cache.k_cache[:, row : row + 1, :length].copy_(
+                prefill_cache.k_cache[:, group_row : group_row + 1, :length]
+            )
+            batch_cache.v_cache[:, row : row + 1, :length].copy_(
+                prefill_cache.v_cache[:, group_row : group_row + 1, :length]
+            )
+            batch_cache.cache_seqlens[row] = length
+            previous_embeddings[row] = prefill_cache.prev_embedding[
+                group_row : group_row + 1
+            ]
+    batch_cache.prev_embedding = torch.cat(previous_embeddings, dim=0)
+
+    logits = torch.cat(next_logits, dim=0)
+    assistant_end, bos = _terminal_token_ids(tokenizer)
+    generated = [[] for _ in range(batch_size)]
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    for step in range(max_new_tokens):
+        next_ids = torch.argmax(logits, dim=-1)
+        terminal = (next_ids == assistant_end) | (next_ids == bos)
+        active = ~finished
+        for row, token in enumerate(next_ids.tolist()):
+            if active[row].item() and not terminal[row].item():
+                generated[row].append(token)
+        finished |= terminal
+        if finished.all() or step + 1 == max_new_tokens:
+            break
+        # Finished rows remain in the tensor so active rows can continue decoding.
+        # Their state is irrelevant, and BOS is a stable filler token.
+        decode_ids = torch.where(finished, torch.full_like(next_ids, bos), next_ids)
+        logits = raw_model.forward(
+            decode_ids.unsqueeze(1), kv_cache=batch_cache
+        )[:, -1, :]
+    return [tokenizer.decode(tokens).strip() for tokens in generated]
+
+
+@torch.inference_mode()
+def _generate_armt_completions(
+    model,
+    tokenizer,
+    prompt_tokens: Sequence[list[int]],
+    max_new_tokens: int,
+) -> list[str]:
+    """Batch ARMT prompts with equal lengths without padding their context."""
+    raw_model = getattr(model, "_orig_mod", model)
+    device = raw_model.get_device()
+    assistant_end, bos = _terminal_token_ids(tokenizer)
+    generated = [None] * len(prompt_tokens)
+    groups: dict[int, list[int]] = defaultdict(list)
+    for row, tokens in enumerate(prompt_tokens):
+        groups[len(tokens)].append(row)
+
+    # ARMT recomputes full prefixes and has no padding mask. Exact-length
+    # bucketing therefore gives true batching while preserving model semantics.
+    for rows in groups.values():
+        ids = torch.tensor([prompt_tokens[row] for row in rows], dtype=torch.long, device=device)
+        group_generated = [[] for _ in rows]
+        finished = torch.zeros(len(rows), dtype=torch.bool, device=device)
+        for step in range(max_new_tokens):
+            logits = raw_model.forward(ids)[:, -1, :]
+            next_ids = torch.argmax(logits, dim=-1)
+            terminal = (next_ids == assistant_end) | (next_ids == bos)
+            active = ~finished
+            for group_row, token in enumerate(next_ids.tolist()):
+                if active[group_row].item() and not terminal[group_row].item():
+                    group_generated[group_row].append(token)
+            finished |= terminal
+            if finished.all() or step + 1 == max_new_tokens:
+                break
+            next_ids = torch.where(finished, torch.full_like(next_ids, bos), next_ids)
+            ids = torch.cat((ids, next_ids.unsqueeze(1)), dim=1)
+        for row, tokens in zip(rows, group_generated):
+            generated[row] = tokenizer.decode(tokens).strip()
+    return generated
+
+
+@torch.inference_mode()
+def generate_babilong_completions(
+    model,
+    tokenizer,
+    prompts: Sequence[str],
+    max_new_tokens: int = 20,
+) -> list[str]:
+    """Greedily generate completion-only strings for a batch of prompts."""
+    if not 10 <= max_new_tokens <= 30:
+        raise ValueError("BABILong max_new_tokens must be between 10 and 30")
+    if isinstance(prompts, str) or not prompts:
+        raise ValueError("prompts must be a non-empty sequence of strings")
+    bos = tokenizer.get_bos_token_id()
+    prompt_tokens = [tokenizer(prompt, prepend=bos) for prompt in prompts]
+    _ensure_rotary_capacity(model, max(map(len, prompt_tokens)) + max_new_tokens)
+    raw_model = getattr(model, "_orig_mod", model)
+    if hasattr(raw_model, "armt_layers"):
+        return _generate_armt_completions(
+            raw_model, tokenizer, prompt_tokens, max_new_tokens
+        )
+    return _generate_gpt_completions(raw_model, tokenizer, prompt_tokens, max_new_tokens)
+
+
 def generate_babilong_completion(
     model,
     tokenizer,
     prompt: str,
     max_new_tokens: int = 20,
 ) -> str:
-    """Greedily generate only the completion portion of one BABILong prompt."""
-    if not 10 <= max_new_tokens <= 30:
-        raise ValueError("BABILong max_new_tokens must be between 10 and 30")
-    prompt_tokens = tokenizer(prompt, prepend=tokenizer.get_bos_token_id())
-    _ensure_rotary_capacity(model, len(prompt_tokens) + max_new_tokens)
-
-    # ARMT currently uses an exact prefix-recomputation generation path. Calling
-    # it directly avoids allocating the base GPT KV cache, which ARMT does not use.
-    raw_model = getattr(model, "_orig_mod", model)
-    if hasattr(raw_model, "armt_layers"):
-        completion_tokens = list(
-            raw_model.generate(
-                prompt_tokens,
-                max_tokens=max_new_tokens,
-                temperature=0.0,
-            )
-        )
-    else:
-        engine = Engine(model, tokenizer)
-        generated, _ = engine.generate_batch(
-            prompt_tokens,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=0.0,
-        )
-        completion_tokens = generated[0][len(prompt_tokens) :]
-    return tokenizer.decode(completion_tokens).strip()
+    """Backward-compatible single-prompt wrapper."""
+    return generate_babilong_completions(
+        model, tokenizer, [prompt], max_new_tokens=max_new_tokens
+    )[0]
 
 
 def evaluate_babilong(
@@ -207,6 +337,7 @@ def evaluate_babilong(
     dataset_name: str = BABILONG_DATASET,
     dataset_loader: Callable | None = None,
     generation_fn: Callable | None = None,
+    batch_size: int = DEFAULT_BABILONG_BATCH_SIZE,
 ) -> dict:
     """Load and score BABILong, returning cell, task, length, and overall metrics.
 
@@ -219,8 +350,10 @@ def evaluate_babilong(
         raise ValueError("max_per_task must be -1 or a positive integer")
     if not 10 <= max_new_tokens <= 30:
         raise ValueError("BABILong max_new_tokens must be between 10 and 30")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
     dataset_loader = dataset_loader or load_hub_dataset
-    generation_fn = generation_fn or generate_babilong_completion
+    generation_fn = generation_fn or generate_babilong_completions
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -243,12 +376,22 @@ def evaluate_babilong(
 
             local_correct = 0
             local_count = 0
-            for logical_index in range(rank, len(indices), world_size):
-                sample = data[indices[logical_index]]
-                prompt = format_babilong_prompt(sample, task)
-                completion = generation_fn(model, tokenizer, prompt, max_new_tokens)
-                local_correct += int(answer_in_completion(sample["target"], completion))
-                local_count += 1
+            local_indices = indices[rank::world_size]
+            for batch_start in range(0, len(local_indices), batch_size):
+                batch_indices = local_indices[batch_start : batch_start + batch_size]
+                samples = [data[index] for index in batch_indices]
+                prompts = [format_babilong_prompt(sample, task) for sample in samples]
+                completions = generation_fn(model, tokenizer, prompts, max_new_tokens)
+                if len(completions) != len(samples):
+                    raise ValueError(
+                        "BABILong generation_fn returned a different number of completions "
+                        "than prompts"
+                    )
+                local_correct += sum(
+                    answer_in_completion(sample["target"], completion)
+                    for sample, completion in zip(samples, completions)
+                )
+                local_count += len(samples)
 
             counts = torch.tensor(
                 [local_correct, local_count],
@@ -277,6 +420,7 @@ def evaluate_babilong(
         "example_counts": example_counts,
         "tasks": list(selected_tasks),
         "lengths": list(selected_lengths),
+        "batch_size": batch_size,
     }
 
 
@@ -286,11 +430,13 @@ __all__ = [
     "BABILONG_LENGTHS",
     "DEFAULT_BABILONG_TASKS",
     "DEFAULT_BABILONG_LENGTHS",
+    "DEFAULT_BABILONG_BATCH_SIZE",
     "parse_babilong_tasks",
     "parse_babilong_lengths",
     "format_babilong_prompt",
     "answer_in_completion",
     "aggregate_babilong_scores",
+    "generate_babilong_completions",
     "generate_babilong_completion",
     "evaluate_babilong",
 ]

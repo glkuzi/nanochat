@@ -33,9 +33,10 @@ def test_substring_metric_and_aggregates():
 
 def test_evaluate_babilong_returns_all_aggregation_levels():
     rows = [
-        {"input": "Mary moved to the kitchen.", "question": "Where is Mary?", "target": "kitchen"},
-        {"input": "John moved to the kitchen.", "question": "Where is John?", "target": "kitchen"},
+        {"input": f"Person {i} moved to the kitchen.", "question": f"Where is person {i}?", "target": "kitchen"}
+        for i in range(10)
     ]
+    observed_batch_sizes = []
 
     def dataset_loader(repo_id, subset, split):
         assert repo_id == "test/babilong"
@@ -43,10 +44,11 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
         assert split in {"qa1", "qa2"}
         return rows
 
-    def generation_fn(model, tokenizer, prompt, max_new_tokens):
-        assert "<context>" in prompt
+    def generation_fn(model, tokenizer, prompts, max_new_tokens):
+        assert all("<context>" in prompt for prompt in prompts)
         assert max_new_tokens == 20
-        return "The answer is KITCHEN."
+        observed_batch_sizes.append(len(prompts))
+        return ["The answer is KITCHEN."] * len(prompts)
 
     result = evaluate_babilong(
         model=object(),
@@ -66,4 +68,20 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
     assert result["task_results"] == {"qa1": 1.0, "qa2": 1.0}
     assert result["length_results"] == {"0k": 1.0, "1k": 1.0}
     assert result["babilong_metric"] == 1.0
-    assert result["example_counts"]["qa1"]["0k"] == 2
+    assert result["example_counts"]["qa1"]["0k"] == 10
+    assert result["batch_size"] == 8
+    assert observed_batch_sizes == [8, 2] * 4
+
+
+def test_evaluate_babilong_rejects_invalid_batch_size():
+    try:
+        evaluate_babilong(
+            model=object(),
+            tokenizer=object(),
+            device=torch.device("cpu"),
+            batch_size=0,
+        )
+    except ValueError as exc:
+        assert str(exc) == "batch_size must be a positive integer"
+    else:
+        raise AssertionError("expected invalid batch size to fail")

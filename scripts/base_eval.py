@@ -141,6 +141,7 @@ def main():
     parser.add_argument('--babilong-lengths', type=str, default='0k-32k', help='BABILong context lengths, e.g. 0k-32k or 0k,4k,32k (default: 0k-32k)')
     parser.add_argument('--babilong-max-per-task', type=int, default=-1, help='Max examples per BABILong task/length (-1 = all 100)')
     parser.add_argument('--babilong-max-new-tokens', type=int, default=20, choices=range(10, 31), metavar='N', help='Greedy generation budget from 10 to 30 tokens (default: 20)')
+    parser.add_argument('--babilong-batch-size', type=int, default=8, help='Per-device BABILong generation batch size (default: 8)')
     parser.add_argument('--babilong-dataset', type=str, default='RMT-team/babilong', help='Hugging Face BABILong dataset repository')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
@@ -246,6 +247,7 @@ def main():
             lengths=babilong_lengths,
             max_per_task=args.babilong_max_per_task,
             max_new_tokens=args.babilong_max_new_tokens,
+            batch_size=args.babilong_batch_size,
             dataset_name=args.babilong_dataset,
         )
         print0("\nBABILong length aggregates:")

@@ -162,17 +162,27 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 
     # SDPA fallback: manually manage KV cache
     B, T_new, H, D = q.shape
-    pos = cache_seqlens[0].item()  # assume uniform position across batch
+    positions = cache_seqlens.to(dtype=torch.long)
+    end_positions = positions + T_new
+    uniform_positions = bool(torch.all(positions == positions[0]).item())
 
-    # Insert new k, v into cache (in-place, matching FA3 behavior)
+    # Insert new k, v into cache (in-place, matching FA3 behavior). BABILong
+    # decoding can have a different prompt length in each batch row.
     if k is not None and v is not None:
-        k_cache[:, pos:pos+T_new, :, :] = k
-        v_cache[:, pos:pos+T_new, :, :] = v
+        if uniform_positions:
+            pos = positions[0].item()
+            k_cache[:, pos:pos+T_new, :, :] = k
+            v_cache[:, pos:pos+T_new, :, :] = v
+        else:
+            rows = torch.arange(B, device=q.device).unsqueeze(1)
+            offsets = torch.arange(T_new, device=q.device).unsqueeze(0)
+            write_positions = positions.unsqueeze(1) + offsets
+            k_cache[rows, write_positions] = k
+            v_cache[rows, write_positions] = v
 
-    # Get full cache up to current position + new tokens
-    end_pos = pos + T_new
-    k_full = k_cache[:, :end_pos, :, :]
-    v_full = v_cache[:, :end_pos, :, :]
+    max_end_pos = int(end_positions.max().item())
+    k_full = k_cache[:, :max_end_pos, :, :]
+    v_full = v_cache[:, :max_end_pos, :, :]
 
     # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
     q_sdpa = q.transpose(1, 2)
@@ -180,7 +190,27 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     v_sdpa = v_full.transpose(1, 2)
 
     enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+    if uniform_positions:
+        y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+    else:
+        query_positions = positions.unsqueeze(1) + torch.arange(T_new, device=q.device)
+        key_positions = torch.arange(max_end_pos, device=q.device)
+        if causal:
+            mask = key_positions.view(1, 1, -1) <= query_positions.unsqueeze(-1)
+        else:
+            mask = key_positions.view(1, 1, -1) < end_positions.view(-1, 1, 1)
+        window = window_size[0]
+        if window >= 0:
+            mask &= (
+                query_positions.unsqueeze(-1) - key_positions.view(1, 1, -1)
+            ) <= window
+        y_sdpa = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=mask.unsqueeze(1),
+            enable_gqa=enable_gqa,
+        )
 
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 

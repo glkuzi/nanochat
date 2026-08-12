@@ -460,12 +460,31 @@ class GPT(nn.Module):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        max_rotary_position = T
+        if kv_cache is not None:
+            max_rotary_position += int(kv_cache.cache_seqlens.max().item())
+        assert max_rotary_position <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {max_rotary_position} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        if kv_cache is None:
+            cos_sin = self.cos[:, :T], self.sin[:, :T]
+        else:
+            cache_positions = kv_cache.cache_seqlens.to(dtype=torch.long)
+            if torch.all(cache_positions == cache_positions[0]):
+                start = cache_positions[0].item()
+                cos_sin = self.cos[:, start:start+T], self.sin[:, start:start+T]
+            else:
+                # Mixed-length generation batches need a different absolute RoPE
+                # position in each row. Shape remains broadcast-compatible with
+                # q/k: (B, T, 1, head_dim/2).
+                offsets = torch.arange(T, device=idx.device)
+                positions = cache_positions.unsqueeze(1) + offsets
+                shape = (B, T, 1, self.cos.size(-1))
+                cos_sin = (
+                    self.cos[0].index_select(0, positions.flatten()).view(shape),
+                    self.sin[0].index_select(0, positions.flatten()).view(shape),
+                )
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
