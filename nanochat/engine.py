@@ -136,6 +136,22 @@ class KVCache:
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
 
+
+class TokenHistoryCache:
+    """Lightweight cache for ARMT, whose exact decode fallback stores token history."""
+
+    def __init__(self, batch_size, seq_len, device, **_):
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.prev_embedding = None
+
+    def prefill(self, other):
+        assert self.prev_embedding is None, "Cannot prefill a non-empty history cache"
+        self.cache_seqlens.fill_(other.cache_seqlens[0])
+        self.prev_embedding = other.prev_embedding
+
+
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -193,8 +209,9 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
+        cache_cls = TokenHistoryCache if hasattr(m, "num_mem_tokens") else KVCache
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
+        kv_cache_prefill = cache_cls(
             batch_size=1,
             seq_len=len(tokens),
             device=device,
@@ -207,7 +224,7 @@ class Engine:
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
+        kv_cache_decode = cache_cls(
             batch_size=num_samples,
             seq_len=kv_length_hint,
             device=device,

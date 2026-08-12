@@ -5,7 +5,7 @@ python -m pytest tests/test_engine.py -v
 """
 
 import torch
-from nanochat.engine import KVCache, Engine
+from nanochat.engine import Engine, KVCache, TokenHistoryCache
 from dataclasses import dataclass
 
 
@@ -47,6 +47,30 @@ class MockModel:
         return logits
 
 
+class MockARMTModel(MockModel):
+    """Mock ARMT decode fallback that stores complete token history."""
+
+    def __init__(self, vocab_size=262):
+        super().__init__(vocab_size)
+        self.config.num_mem_tokens = 2
+        self.cache_instances = []
+
+    def forward(self, ids, kv_cache=None):
+        assert isinstance(kv_cache, TokenHistoryCache)
+        self.cache_instances.append(kv_cache)
+        history = kv_cache.prev_embedding
+        if history is not None:
+            history = history.squeeze(-1).to(dtype=ids.dtype)
+            if history.size(0) == 1 and ids.size(0) != 1:
+                history = history.expand(ids.size(0), -1)
+            full_ids = torch.cat((history, ids), dim=1)
+        else:
+            full_ids = ids
+        kv_cache.prev_embedding = full_ids.unsqueeze(-1)
+        kv_cache.cache_seqlens.fill_(full_ids.size(1))
+        return torch.zeros(ids.size(0), ids.size(1), self.vocab_size)
+
+
 class ByteTokenizer:
     """
     Simple byte-level tokenizer for testing.
@@ -80,6 +104,18 @@ class ByteTokenizer:
         # Filter out special tokens before decoding
         byte_tokens = [t for t in tokens if t < 256]
         return bytes(byte_tokens).decode("utf-8", errors="replace")
+
+
+def test_engine_uses_token_history_cache_for_armt_generation():
+    model = MockARMTModel()
+    engine = Engine(model, ByteTokenizer())
+    prompt = [261, 72, 105]
+    results, _ = engine.generate_batch(prompt, num_samples=3, max_tokens=2, temperature=0)
+
+    assert all(len(result) == len(prompt) + 2 for result in results)
+    assert all(isinstance(cache, TokenHistoryCache) for cache in model.cache_instances)
+    assert all(not hasattr(cache, "k_cache") for cache in model.cache_instances)
+
 
 def test_kv_cache_basic():
     """Test basic KVCache functionality for FA3."""

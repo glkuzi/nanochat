@@ -11,7 +11,14 @@ from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
 
 parser = argparse.ArgumentParser(description='Chat with the model')
-parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
+parser.add_argument(
+    '-i', '--source', choices=('base', 'sft', 'rl'), default='sft',
+    help="Checkpoint source: base (pretrained), sft, or rl",
+)
+parser.add_argument(
+    '--model-type', '--model_type', choices=('auto', 'gpt', 'armt'), default='auto',
+    help="Expected architecture; auto detects it from checkpoint metadata",
+)
 parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
@@ -25,6 +32,12 @@ args = parser.parse_args()
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+loaded_model_type = "armt" if hasattr(model.config, "num_mem_tokens") else "gpt"
+if args.model_type != "auto" and args.model_type != loaded_model_type:
+    parser.error(
+        f"Requested {args.model_type}, but checkpoint contains {loaded_model_type}"
+    )
+print(f"Loaded {loaded_model_type.upper()} from {args.source} checkpoints")
 
 # Special tokens for the chat state machine
 bos = tokenizer.get_bos_token_id()

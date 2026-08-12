@@ -11,6 +11,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 
 import gc
 import argparse
+from dataclasses import asdict
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -23,6 +24,7 @@ from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
+from nanochat.armt import ARMTGPT
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
@@ -41,16 +43,39 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument(
+    "--model-type",
+    "--model_type",
+    choices=("auto", "gpt", "armt"),
+    default="auto",
+    help="output architecture: preserve checkpoint, require GPT, or wrap GPT as ARMT",
+)
+parser.add_argument(
+    "--output-model-tag", default=None, help="SFT checkpoint tag (default: --model-tag)"
+)
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
+# ARMT options are used only when wrapping a plain GPT checkpoint.
+parser.add_argument("--num-mem-tokens", "--num_mem_tokens", dest="num_mem_tokens", type=int, default=16)
+parser.add_argument("--d-mem", "--d_mem", dest="d_mem", type=int, default=64)
+parser.add_argument("--segment-size", "--segment_size", dest="segment_size", type=int, default=512)
+parser.add_argument(
+    "--segment-position-mode",
+    choices=("absolute", "reset"),
+    default="absolute",
+)
+parser.add_argument("--armt-heads", type=int, default=1)
+parser.add_argument("--use-sink", action="store_true")
+parser.add_argument("--no-correction", action="store_true")
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
+parser.add_argument("--scalar-lr", type=float, default=None, help="learning rate for scalar parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -93,6 +118,30 @@ if not HAS_FA3:
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
 
+input_is_armt = isinstance(model, ARMTGPT)
+wrapped_gpt_with_armt = False
+if args.model_type == "gpt" and input_is_armt:
+    parser.error(
+        "--model-type gpt cannot unwrap an ARMT checkpoint; use auto or armt"
+    )
+if args.model_type == "armt" and not input_is_armt:
+    model = ARMTGPT.from_gpt(
+        model,
+        num_mem_tokens=args.num_mem_tokens,
+        d_mem=args.d_mem,
+        segment_size=args.segment_size,
+        segment_position_mode=args.segment_position_mode,
+        n_heads=args.armt_heads,
+        use_sink=args.use_sink,
+        correction=not args.no_correction,
+    )
+    wrapped_gpt_with_armt = True
+    print0(
+        "Wrapped pretrained GPT weights with newly initialized ARMT parameters"
+    )
+effective_model_type = "armt" if isinstance(model, ARMTGPT) else "gpt"
+print0(f"SFT model architecture: {effective_model_type}")
+
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
 for name, fallback, source in [
@@ -102,6 +151,7 @@ for name, fallback, source in [
     ("embedding_lr",      0.3,   pretrain_user_config),
     ("unembedding_lr",    0.004, pretrain_user_config),
     ("matrix_lr",         0.02,  pretrain_user_config),
+    ("scalar_lr",         0.5,   pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -115,6 +165,8 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
+checkpoint_model_config = asdict(orig_model.config)
+checkpoint_model_config["sequence_len"] = args.max_seq_len
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
@@ -129,14 +181,24 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+optimizer = model.setup_optimizer(
+    unembedding_lr=args.unembedding_lr,
+    embedding_lr=args.embedding_lr,
+    matrix_lr=args.matrix_lr,
+    scalar_lr=args.scalar_lr,
+    weight_decay=0.0,
+)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
-if args.load_optimizer:
+if args.load_optimizer and wrapped_gpt_with_armt:
+    print0(
+        "Skipping GPT optimizer warm-start because ARMT adds new parameter groups"
+    )
+elif args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -390,7 +452,11 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+        output_dirname = (
+            args.output_model_tag
+            or args.model_tag
+            or f"d{depth}"
+        )
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -400,14 +466,14 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
+                "model_config": checkpoint_model_config,
+                "model_type": effective_model_type,
+                "parent_checkpoint": {
+                    "source": "base",
+                    "model_tag": args.model_tag,
+                    "step": meta.get("step", args.model_step),
+                    "input_model_type": "armt" if input_is_armt else "gpt",
+                    "wrapped_gpt_with_armt": wrapped_gpt_with_armt,
                 },
                 "user_config": user_config, # inputs to the training script
             },

@@ -134,6 +134,22 @@ def build_parser() -> argparse.ArgumentParser:
     # also force the corresponding evaluation at the final training step.
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-batches", type=int, default=20)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=-1,
+        metavar="STEPS",
+        help=(
+            "stop after this many training steps without validation BPB "
+            "improvement (-1 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="minimum validation BPB decrease counted as an improvement",
+    )
     parser.add_argument("--core-metric-every", type=int, default=2000)
     parser.add_argument("--core-metric-max-per-task", type=int, default=-1)
     parser.add_argument(
@@ -304,6 +320,28 @@ def _should_evaluate(
     return every > 0 and (last_step or periodic)
 
 
+def _update_early_stopping(
+    val_bpb: float,
+    step: int,
+    best_bpb: float,
+    best_step: int | None,
+    patience_steps: int,
+    min_delta: float,
+) -> tuple[float, int, bool, bool]:
+    """Update best validation state and decide whether patience is exhausted."""
+    improved = best_step is None or val_bpb < best_bpb - min_delta
+    if improved:
+        best_bpb = val_bpb
+        best_step = step
+    assert best_step is not None
+    should_stop = (
+        patience_steps >= 0
+        and not improved
+        and step - best_step >= patience_steps
+    )
+    return best_bpb, best_step, improved, should_stop
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -317,6 +355,14 @@ def main() -> None:
         parser.error("--total-batch-size must be -1 or a positive integer")
     if args.eval_every > 0 and args.eval_batches <= 0:
         parser.error("--eval-batches must be positive when validation is enabled")
+    if args.early_stopping_patience < -1:
+        parser.error("--early-stopping-patience must be -1 or non-negative")
+    if args.early_stopping_min_delta < 0:
+        parser.error("--early-stopping-min-delta must be non-negative")
+    if args.early_stopping_patience >= 0 and args.eval_every <= 0:
+        parser.error(
+            "--eval-every must be positive when early stopping is enabled"
+        )
     if not 0.0 <= args.warmdown_ratio <= 1.0:
         parser.error("--warmdown-ratio must be between zero and one")
     try:
@@ -458,6 +504,9 @@ def main() -> None:
     step = 0
     smooth_loss = 0.0
     total_training_time = 0.0
+    best_validation_bpb = float("inf")
+    best_validation_step = None
+    early_stopped = False
     latest_validation = None
     latest_core = None
     latest_babilong = None
@@ -473,16 +522,49 @@ def main() -> None:
             val_bpb = evaluate_bpb(
                 model, build_val_stream(), args.eval_batches, token_bytes
             )
+            (
+                best_validation_bpb,
+                best_validation_step,
+                validation_improved,
+                patience_exhausted,
+            ) = _update_early_stopping(
+                val_bpb,
+                step,
+                best_validation_bpb,
+                best_validation_step,
+                args.early_stopping_patience,
+                args.early_stopping_min_delta,
+            )
+            steps_since_improvement = step - best_validation_step
+            stop_for_patience = patience_exhausted and not last_step
+            if stop_for_patience:
+                early_stopped = True
+                last_step = True
             latest_validation = {
                 "evaluated_at_step": step,
                 "scores": {"answer_bpb": val_bpb},
+                "is_best": validation_improved,
+                "best_answer_bpb": best_validation_bpb,
+                "best_step": best_validation_step,
+                "steps_since_improvement": steps_since_improvement,
+                "early_stopping_triggered": stop_for_patience,
                 "batches": args.eval_batches,
                 "tasks": list(train_tasks),
                 "lengths": list(train_lengths),
                 "eval_time_seconds": time.time() - eval_started,
             }
             print0(f"Step {step:05d} | BABILong validation answer bpb: {val_bpb:.6f}")
-            wandb_run.log({"step": step, "validation/answer_bpb": val_bpb})
+            wandb_run.log({
+                "step": step,
+                "validation/answer_bpb": val_bpb,
+                "validation/best_answer_bpb": best_validation_bpb,
+                "validation/steps_since_improvement": steps_since_improvement,
+            })
+            if stop_for_patience:
+                print0(
+                    f"Early stopping at step {step}: validation BPB has not "
+                    f"improved for {steps_since_improvement} steps"
+                )
             model.train()
 
         run_core_eval = _should_evaluate(step, last_step, args.core_metric_every)
@@ -571,6 +653,10 @@ def main() -> None:
         )
         if save_now:
             peak_memory = int(get_max_memory())
+            if early_stopped:
+                stop_reason = "early_stopping"
+            else:
+                stop_reason = "iteration_limit" if last_step else None
             evaluation = {
                 "checkpoint_step": step,
                 "reproducibility": {
@@ -583,11 +669,33 @@ def main() -> None:
                     "dataset": args.train_dataset,
                     "tasks": list(train_tasks),
                     "lengths": list(train_lengths),
+                    "requested_iterations": args.num_iterations,
+                    "completed_iterations": step,
+                    "stop_reason": stop_reason,
                     "total_time_seconds": total_training_time,
                     "total_flops": flops_so_far,
                     "peak_memory_bytes": peak_memory,
                     "peak_memory_mib": peak_memory / (1024 * 1024),
                     "data_stream": train_stream.stats(),
+                },
+                "early_stopping": {
+                    "enabled": args.early_stopping_patience >= 0,
+                    "patience_steps": args.early_stopping_patience,
+                    "min_delta": args.early_stopping_min_delta,
+                    "monitored_metric": "validation/answer_bpb",
+                    "best_validation_bpb": (
+                        best_validation_bpb
+                        if best_validation_step is not None
+                        else None
+                    ),
+                    "best_step": best_validation_step,
+                    "steps_since_improvement": (
+                        None
+                        if best_validation_step is None
+                        else step - best_validation_step
+                    ),
+                    "stopped_early": early_stopped,
+                    "stop_step": step if early_stopped else None,
                 },
                 "validation": latest_validation,
                 "core": latest_core,
@@ -685,6 +793,10 @@ def main() -> None:
         elif step % 5000 == 0:
             gc.collect()
 
+    if early_stopped:
+        print0(
+            f"Best validation BPB: {best_validation_bpb:.6f} at step {best_validation_step}"
+        )
     print0(f"Saved BABILong-trained checkpoint to {checkpoint_dir}")
     print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
     print0(f"Total training time: {total_training_time / 60:.2f}m")

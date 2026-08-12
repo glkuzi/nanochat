@@ -80,7 +80,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--babilong-every", type=int, default=2000, help="evaluate BABILong every N steps (-1 = disable)")
 parser.add_argument("--babilong-tasks", type=str, default="qa1-qa5", help="BABILong tasks, e.g. qa1-qa5 or qa1,qa3")
-parser.add_argument("--babilong-lengths", type=str, default="0k-32k", help="BABILong lengths, e.g. 0k-32k or 0k,4k,32k")
+parser.add_argument("--babilong-lengths", type=str, default="0k-8k", help="BABILong lengths, e.g. 0k-32k or 0k,4k,32k")
 parser.add_argument("--babilong-max-per-task", type=int, default=-1, help="examples per BABILong task/length (-1 = all 100)")
 parser.add_argument("--babilong-max-new-tokens", type=int, default=20, choices=range(10, 31), metavar="N", help="BABILong greedy generation budget from 10 to 30 tokens")
 parser.add_argument("--babilong-dataset", type=str, default="RMT-team/babilong", help="Hugging Face BABILong dataset repository")

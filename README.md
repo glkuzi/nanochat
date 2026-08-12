@@ -83,6 +83,47 @@ A few more notes:
 - If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
 - Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
 
+### ARMT chat SFT
+
+`scripts.chat_sft` can fine-tune an existing ARMT base checkpoint or wrap a
+pretrained GPT checkpoint with newly initialized ARMT memory before SFT.
+
+Fine-tune a pretrained ARMT model:
+
+```bash
+python -m scripts.chat_sft \
+    --model-tag armt_d4 --model-type armt \
+    --output-model-tag armt_d4_sft
+```
+
+Wrap a pretrained GPT and train the resulting ARMTGPT:
+
+```bash
+python -m scripts.chat_sft \
+    --model-tag gpt_d4 --model-type armt \
+    --num-mem-tokens 16 --d-mem 64 --segment-size 512 \
+    --output-model-tag gpt_d4_armt_sft
+```
+
+`--model-type auto` (the default) preserves the checkpoint architecture. A
+direct ARMT load can warm-start its optimizer; GPT-to-ARMT wrapping uses a fresh
+optimizer because the new ARMT parameter groups have no GPT optimizer state.
+
+Both `chat_cli` and `chat_eval` detect ARMT from checkpoint metadata and accept
+`--source base` for pretrained checkpoints or `--source sft` after chat SFT:
+
+```bash
+# Chat with a pretrained ARMT checkpoint.
+python -m scripts.chat_cli --source base --model-tag armt_d4
+# Chat with its SFT checkpoint.
+python -m scripts.chat_cli --source sft --model-tag armt_d4_sft
+# Run ChatCORE tasks against the SFT checkpoint.
+python -m scripts.chat_eval --source sft --model-tag armt_d4_sft
+```
+
+Pass `--model-type armt` when you want the command to fail rather than
+accidentally load a GPT checkpoint with the same tag.
+
 ### BABILong training
 
 `scripts.babilong_train` trains either GPT or ARMTGPT with answer-only loss on
@@ -131,6 +172,13 @@ BABILong run every `--core-metric-every` and `--babilong-eval-every` steps; all
 enabled evaluations also run after the final training step. Their per-task and
 aggregated scores, timings, seeds, training time, and peak memory are saved in
 `eval_<step>.json` beside each checkpoint.
+
+Early stopping is disabled by default. Enable it with, for example,
+`--num-iterations 10000 --eval-every 250 --early-stopping-patience 1000`.
+Patience is measured in training steps since the best validation answer BPB,
+and stopping is checked at validation intervals. Use
+`--early-stopping-min-delta` to ignore improvements smaller than a chosen BPB
+difference.
 
 ## Research
 

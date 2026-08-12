@@ -84,6 +84,13 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 # A lot easier because we don't have to sample. Therefore, we can actually go
 # batches at a time and just check the logits for correct answer choices.
 
+def _forward_chat_prompts(model, prompt_ids, prompt_lengths):
+    """Use ARMT's ragged forward while retaining the normal GPT path."""
+    if hasattr(model, "forward_padded"):
+        return model.forward_padded(prompt_ids, prompt_lengths)
+    return model(prompt_ids)
+
+
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
@@ -105,13 +112,14 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         conversations = [task_object[ii] for ii in range(i0, i1)]
         prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
         max_length = max(len(ids) for ids in prompt_ids)
-        answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
+        prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
+        answer_time_positions = (prompt_lengths - 1).tolist()
         padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
         with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
+            logits = _forward_chat_prompts(model, prompt_ids, prompt_lengths)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
@@ -179,7 +187,14 @@ if __name__ == "__main__":
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--source', type=str, required=True, help="Source of the model: sft|rl")
+    parser.add_argument(
+        '-i', '--source', choices=('base', 'sft', 'rl'), default='sft',
+        help="Checkpoint source: base (pretrained), sft, or rl",
+    )
+    parser.add_argument(
+        '--model-type', '--model_type', choices=('auto', 'gpt', 'armt'), default='auto',
+        help="Expected architecture; auto detects it from checkpoint metadata",
+    )
     parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
@@ -196,6 +211,12 @@ if __name__ == "__main__":
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    loaded_model_type = "armt" if hasattr(model.config, "num_mem_tokens") else "gpt"
+    if args.model_type != "auto" and args.model_type != loaded_model_type:
+        parser.error(
+            f"Requested {args.model_type}, but checkpoint contains {loaded_model_type}"
+        )
+    print0(f"Loaded {loaded_model_type.upper()} from {args.source} checkpoints")
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
