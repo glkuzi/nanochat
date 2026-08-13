@@ -4,8 +4,9 @@ All the generic code lives here, and all the evaluation-specific
 code lives in nanochat directory and is imported from here.
 
 Example runs:
-python -m scripts.chat_eval -i sft -a ARC-Easy
-torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
+python -m scripts.chat_eval -i sft -a ARC-Easy --eval chat
+python -m scripts.chat_eval -i sft --eval babilong --babilong-tasks qa1-qa5
+torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy --eval chat
 """
 
 import argparse
@@ -14,6 +15,13 @@ import torch
 import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.babilong_eval import (
+    BABILONG_DATASET,
+    DEFAULT_BABILONG_BATCH_SIZE,
+    evaluate_babilong,
+    parse_babilong_lengths,
+    parse_babilong_tasks,
+)
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -183,6 +191,56 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     return acc
 
 # -----------------------------------------------------------------------------
+
+def parse_eval_modes(value):
+    """Parse and validate the independently aggregated evaluation groups."""
+    modes = tuple(dict.fromkeys(part.strip().lower() for part in value.split(",") if part.strip()))
+    valid_modes = {"chat", "babilong"}
+    invalid_modes = set(modes) - valid_modes
+    if not modes:
+        raise ValueError("At least one evaluation mode is required")
+    if invalid_modes:
+        raise ValueError(
+            f"Invalid evaluation modes: {sorted(invalid_modes)}. "
+            f"Valid modes: {sorted(valid_modes)}"
+        )
+    return modes
+
+
+def run_chat_babilong_eval(
+    model,
+    tokenizer,
+    device,
+    tasks=None,
+    lengths=None,
+    max_per_task=-1,
+    max_new_tokens=20,
+    batch_size=DEFAULT_BABILONG_BATCH_SIZE,
+    dataset_name=BABILONG_DATASET,
+):
+    """Evaluate BABILong for either GPT or ARMT and print all aggregates."""
+    result = evaluate_babilong(
+        model,
+        tokenizer,
+        device,
+        tasks=tasks,
+        lengths=lengths,
+        max_per_task=max_per_task,
+        max_new_tokens=max_new_tokens,
+        batch_size=batch_size,
+        dataset_name=dataset_name,
+    )
+    print0("\nBABILong task aggregates:")
+    for task, score in result["task_results"].items():
+        print0(f"  {task}: {score:.4f}")
+    print0("BABILong length aggregates:")
+    for length, score in result["length_results"].items():
+        print0(f"  {length}: {score:.4f}")
+    print0(f"BABILong metric: {result['babilong_metric']:.4f}")
+    return result
+
+# -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
 
     # Parse command-line arguments
@@ -195,6 +253,10 @@ if __name__ == "__main__":
         '--model-type', '--model_type', choices=('auto', 'gpt', 'armt'), default='auto',
         help="Expected architecture; auto detects it from checkpoint metadata",
     )
+    parser.add_argument(
+        '--eval', default='chat,babilong',
+        help='Comma-separated evaluations to run: chat,babilong (default: both)',
+    )
     parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
@@ -204,11 +266,27 @@ if __name__ == "__main__":
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
+    parser.add_argument('--babilong-tasks', type=str, default='qa1-qa5', help='BABILong tasks, e.g. qa1-qa5 or qa1,qa3 (default: qa1-qa5)')
+    parser.add_argument('--babilong-lengths', type=str, default='0k-32k', help='BABILong context lengths, e.g. 0k-32k or 0k,4k,32k (default: 0k-32k)')
+    parser.add_argument('--babilong-max-per-task', type=int, default=-1, help='Max examples per BABILong task/length (-1 = all 100)')
+    parser.add_argument('--babilong-max-new-tokens', type=int, default=20, choices=range(10, 31), metavar='N', help='Greedy BABILong generation budget from 10 to 30 tokens (default: 20)')
+    parser.add_argument('--babilong-batch-size', type=int, default=DEFAULT_BABILONG_BATCH_SIZE, help='Per-device BABILong generation batch size (default: 8)')
+    parser.add_argument('--babilong-dataset', type=str, default=BABILONG_DATASET, help='Hugging Face BABILong dataset repository')
+    parser.add_argument('--seed', type=int, default=42, help='Global Python/NumPy/PyTorch seed (default: 42)')
+    parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=True, help='Require deterministic algorithms (default: enabled)')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
     args = parser.parse_args()
+    try:
+        eval_modes = parse_eval_modes(args.eval)
+        babilong_tasks = parse_babilong_tasks(args.babilong_tasks)
+        babilong_lengths = parse_babilong_lengths(args.babilong_lengths)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(
+        device_type, seed=args.seed, deterministic=args.deterministic
+    )
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     loaded_model_type = "armt" if hasattr(model.config, "num_mem_tokens") else "gpt"
@@ -232,19 +310,20 @@ if __name__ == "__main__":
 
     # Run all the task evaluations sequentially
     results = {}
-    for task_name in task_names:
-        acc = run_chat_eval(
-            task_name,
-            model, tokenizer, engine,
-            batch_size=args.batch_size,
-            num_samples=args.num_samples,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            max_problems=args.max_problems,
-        )
-        results[task_name] = acc
-        print0(f"{task_name} accuracy: {100 * acc:.2f}%")
+    if 'chat' in eval_modes:
+        for task_name in task_names:
+            acc = run_chat_eval(
+                task_name,
+                model, tokenizer, engine,
+                batch_size=args.batch_size,
+                num_samples=args.num_samples,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                max_problems=args.max_problems,
+            )
+            results[task_name] = acc
+            print0(f"{task_name} accuracy: {100 * acc:.2f}%")
 
     # calculate the ChatCORE metric if we can (similar to CORE, it's the mean centered accuracy)
     # this way, ChatCORE ranges from 0 (at random baseline) to 1 (peak performance)
@@ -257,5 +336,24 @@ if __name__ == "__main__":
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
         print0(f"ChatCORE metric: {chatcore_metric:.4f}")
+
+    # BABILong is reported separately and never contributes to ChatCORE.
+    if 'babilong' in eval_modes:
+        print0("\n" + "=" * 50)
+        print0("BABILong Evaluation")
+        print0("=" * 50)
+        print0(f"Tasks: {', '.join(babilong_tasks)}")
+        print0(f"Lengths: {', '.join(babilong_lengths)}")
+        run_chat_babilong_eval(
+            model,
+            tokenizer,
+            device,
+            tasks=babilong_tasks,
+            lengths=babilong_lengths,
+            max_per_task=args.babilong_max_per_task,
+            max_new_tokens=args.babilong_max_new_tokens,
+            batch_size=args.babilong_batch_size,
+            dataset_name=args.babilong_dataset,
+        )
 
     compute_cleanup()

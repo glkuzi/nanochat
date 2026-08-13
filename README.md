@@ -293,6 +293,36 @@ I've published a number of guides that might contain helpful information, most r
 └── uv.lock
 ```
 
+## Hugging Face checkpoint export
+
+Install the optional conversion dependencies, then point the converter at a
+nanochat checkpoint directory. It auto-detects GPT versus ARMTGPT from the
+saved metadata and uses the latest step unless `--step` is provided.
+
+```bash
+pip install "transformers>=4.48,<6" safetensors
+python scripts/convert_to_hf.py \
+    --checkpoint-dir ~/.cache/nanochat/base_checkpoints/d20 \
+    --output-dir ./d20-hf
+```
+
+The output contains weights, `config.json`, and the Python implementation that
+Transformers copies from the Hub when remote code is trusted:
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "OWNER/REPOSITORY",
+    trust_remote_code=True,
+)
+```
+
+Upload directly during conversion with `--push-to-hub OWNER/REPOSITORY`
+(and optionally `--private`), or upload the complete output directory later.
+The converter exports the model architecture and weights, not nanochat's
+tiktoken-based tokenizer.
+
 ## Contributing
 
 The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~1.5 hours (down from 3h), but by improving the pretraining stage we can improve this further.
