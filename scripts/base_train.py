@@ -179,6 +179,16 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+################## DEBUG ####################
+debug = False
+if debug:
+    print0(model)
+    print0(f"Memory {model.memory}")
+    print0(f"Memory {model.armt_layers[0]}")
+    print0(f"Memory {model.armt_layers[0].W_mq.weight}")
+    print0(f"Memory {model.armt_layers[0].W_mk.weight}")
+    print0(f"Memory {model.armt_layers[0].W_mv.weight}")
+    print0(f"Memory {model.armt_layers[0].W_mb.weight}")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -482,6 +492,12 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+        if debug:
+            print0(f"Memory {model.memory}")
+            print0(f"Memory {model.armt_layers[0].W_mq.weight}")
+            print0(f"Memory {model.armt_layers[0].W_mk.weight}")
+            print0(f"Memory {model.armt_layers[0].W_mv.weight}")
+            print0(f"Memory {model.armt_layers[0].W_mb.weight}")
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -643,6 +659,11 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        #if debug and micro_step == 0:
+        #    print0(x.shape)
+        #    print0(y.shape)
+        #    print0(x)
+        #    print0(y)
         loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here

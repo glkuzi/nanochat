@@ -25,6 +25,7 @@ import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
 from nanochat.armt import ARMTGPT
+from nanochat.sft_data import render_sft_conversation
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
@@ -42,6 +43,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
+parser.add_argument("--model-train-type", type=str, default="base", help="from which train stage load model")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 parser.add_argument(
     "--model-type",
@@ -116,7 +118,7 @@ if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(args.model_train_type, device, phase="train", model_tag=args.model_tag, step=args.model_step)
 
 input_is_armt = isinstance(model, ARMTGPT)
 wrapped_gpt_with_armt = False
@@ -165,8 +167,8 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
+orig_model.set_sequence_len(args.max_seq_len)
 checkpoint_model_config = asdict(orig_model.config)
-checkpoint_model_config["sequence_len"] = args.max_seq_len
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
@@ -199,7 +201,7 @@ if args.load_optimizer and wrapped_gpt_with_armt:
         "Skipping GPT optimizer warm-start because ARMT adds new parameter groups"
     )
 elif args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state(args.model_train_type, device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
@@ -244,8 +246,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     BOS-aligned dataloader for SFT with bestfit-pad packing.
 
     Each row in the batch starts with BOS (beginning of a conversation).
-    Conversations are packed using best-fit algorithm. When no conversation fits,
-    the row is padded (instead of cropping) to ensure no tokens are ever discarded.
+    Conversations are rendered to the selected row capacity, then packed using a
+    best-fit algorithm. Examples whose truncated prefix has no assistant target
+    are skipped. When nothing fits the remainder, that remainder is padded.
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
     """
     global last_step, approx_progress, current_epoch
@@ -262,18 +265,31 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
     it = 0  # iteration counter
+    scanned_without_supervision = 0
 
     def refill_buffer():
-        nonlocal cursor, epoch
+        nonlocal cursor, epoch, scanned_without_supervision
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            rendered = render_sft_conversation(
+                tokenizer, conversation, row_capacity=row_capacity
+            )
+            if rendered is None:
+                scanned_without_supervision += 1
+            else:
+                ids, mask = rendered
+                conv_buffer.append((ids, mask))
+                scanned_without_supervision = 0
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
                 epoch += 1
                 # Note: last_step is now triggered based on consumption, not fetching
+            if scanned_without_supervision >= dataset_size:
+                raise RuntimeError(
+                    "No SFT conversation contains an assistant target after "
+                    f"truncation to {row_capacity} tokens"
+                )
 
     while True:
         rows = []
@@ -306,8 +322,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     mask_row.extend(conv_mask)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
-                    # No conversation fits - pad the remainder instead of cropping
-                    # This ensures we never discard any tokens
+                    # No conversation fits: pad rather than split it across rows.
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
@@ -321,6 +336,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
+
+        if not any(any(mask_row[1:]) for mask_row in mask_rows):
+            raise RuntimeError(
+                "SFT packing produced a batch with no supervised targets; "
+                "mean cross-entropy would be NaN"
+            )
 
         # Stopping condition to respect num_iterations, if given
         it += 1
@@ -469,7 +490,7 @@ while True:
                 "model_config": checkpoint_model_config,
                 "model_type": effective_model_type,
                 "parent_checkpoint": {
-                    "source": "base",
+                    "source": args.model_train_type,
                     "model_tag": args.model_tag,
                     "step": meta.get("step", args.model_step),
                     "input_model_type": "armt" if input_is_armt else "gpt",

@@ -397,6 +397,13 @@ class ARMTGPT(GPT):
         if config.wrap_layers is not None and len(config.wrap_layers) != config.n_layer:
             raise ValueError("wrap_layers must contain exactly n_layer entries")
 
+    def _required_rotary_positions(self, sequence_len: int) -> int:
+        extra_tokens = self.config.num_mem_tokens + int(self.config.use_sink)
+        if self.config.segment_position_mode == "reset":
+            return min(sequence_len, self.config.segment_size) + extra_tokens
+        num_segments = math.ceil(sequence_len / self.config.segment_size)
+        return sequence_len + num_segments * extra_tokens
+
     @torch.no_grad()
     def init_weights(self) -> None:
         super().init_weights()

@@ -347,6 +347,7 @@ def evaluate_babilong(
     dataset_loader: Callable | None = None,
     generation_fn: Callable | None = None,
     batch_size: int = DEFAULT_BABILONG_BATCH_SIZE,
+    example_callback: Callable[[str, str, list[dict]], None] | None = None,
 ) -> dict:
     """Load and score BABILong, returning cell, task, length, and overall metrics.
 
@@ -387,6 +388,7 @@ def evaluate_babilong(
             local_correct = 0
             local_count = 0
             local_indices = indices[rank::world_size]
+            local_example_results = [] if example_callback is not None else None
             for batch_start in range(0, len(local_indices), batch_size):
                 batch_indices = local_indices[batch_start : batch_start + batch_size]
                 samples = [data[index] for index in batch_indices]
@@ -397,11 +399,26 @@ def evaluate_babilong(
                         "BABILong generation_fn returned a different number of completions "
                         "than prompts"
                     )
-                local_correct += sum(
+                outcomes = [
                     answer_in_completion(sample["target"], completion)
                     for sample, completion in zip(samples, completions)
-                )
+                ]
+                local_correct += sum(outcomes)
                 local_count += len(samples)
+                if local_example_results is not None:
+                    for dataset_index, sample, completion, matched in zip(
+                        batch_indices, samples, completions, outcomes
+                    ):
+                        local_example_results.append(
+                            {
+                                "_dataset_index": int(dataset_index),
+                                "input_context": str(sample["input"]),
+                                "input_question": str(sample["question"]),
+                                "generated_answer": str(completion),
+                                "ground_truth_answer": str(sample["target"]),
+                                "answers_matched": bool(matched),
+                            }
+                        )
 
             counts = torch.tensor(
                 [local_correct, local_count],
@@ -415,6 +432,32 @@ def evaluate_babilong(
             accuracy = correct_count / evaluated_count
             results[task][length] = accuracy
             example_counts[task][length] = int(evaluated_count)
+            if example_callback is not None:
+                if world_size > 1:
+                    gathered = [None] * world_size if rank == 0 else None
+                    dist.gather_object(local_example_results, gathered, dst=0)
+                else:
+                    gathered = [local_example_results]
+                callback_error = None
+                if rank == 0:
+                    cell_records = [
+                        record
+                        for rank_records in gathered
+                        for record in rank_records
+                    ]
+                    cell_records.sort(key=lambda record: record["_dataset_index"])
+                    for record in cell_records:
+                        record.pop("_dataset_index")
+                    try:
+                        example_callback(task, length, cell_records)
+                    except Exception as exc:
+                        callback_error = f"{type(exc).__name__}: {exc}"
+                if world_size > 1:
+                    callback_status = [callback_error]
+                    dist.broadcast_object_list(callback_status, src=0)
+                    callback_error = callback_status[0]
+                if callback_error is not None:
+                    raise RuntimeError(f"BABILong example callback failed: {callback_error}")
             elapsed = time.time() - started
             cell_eval_seconds[task][length] = elapsed
             print0(

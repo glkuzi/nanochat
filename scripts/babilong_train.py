@@ -39,6 +39,12 @@ from nanochat.babilong_eval import (
     parse_babilong_lengths_train,
     parse_babilong_tasks,
 )
+from nanochat.babilong_generated_data import (
+    BABILONG_QA_MARGIN,
+    DEFAULT_BABILONG_BABI_PATH,
+    DEFAULT_BABILONG_NOISE_DATASET,
+    GeneratedBABILongBatchStream,
+)
 from nanochat.checkpoint_manager import load_model, load_optimizer_state, save_checkpoint
 from nanochat.common import (
     COMPUTE_DTYPE,
@@ -96,7 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-model-tag", default=None)
 
-    # Official pre-generated BABILong training mixture.
+    # Training data backend. ``precomputed`` retains the existing Hub dataset;
+    # ``generated`` reproduces the original bAbI + PG-19 online pipeline for
+    # train/validation only. Official generation benchmarks remain unchanged.
+    parser.add_argument(
+        "--train-data-backend",
+        choices=("precomputed", "generated"),
+        default="precomputed",
+    )
     parser.add_argument("--train-dataset", default=BABILONG_TRAIN_DATASET)
     parser.add_argument(
         "--dataset-cache-dir",
@@ -116,6 +129,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-examples-per-cell", type=int, default=100)
     parser.add_argument("--cell-batches", type=int, default=64)
     parser.add_argument("--oversize-policy", choices=("skip", "error"), default="skip")
+    parser.add_argument("--generated-babi-path", default=DEFAULT_BABILONG_BABI_PATH)
+    parser.add_argument(
+        "--generated-noise-dataset", default=DEFAULT_BABILONG_NOISE_DATASET
+    )
+    parser.add_argument("--generated-noise-config", default=None)
+    parser.add_argument("--generated-noise-train-split", default="train")
+    parser.add_argument("--generated-noise-validation-split", default="test")
+    parser.add_argument(
+        "--generated-vary-lengths",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "sample discrete segment-size multiples through max-seq-len; "
+            "otherwise always construct max-seq-len examples"
+        ),
+    )
+    parser.add_argument(
+        "--generated-mixed-length-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "reference mixed-length curriculum: probability of forcing the "
+            "maximum length (otherwise sample a segment multiple uniformly)"
+        ),
+    )
+    parser.add_argument("--generated-max-n-facts", type=int, default=None)
+    parser.add_argument("--generated-task-start-pct", type=float, default=None)
+    parser.add_argument("--generated-task-end-pct", type=float, default=None)
+    parser.add_argument("--generated-qa-margin", type=int, default=BABILONG_QA_MARGIN)
+    parser.add_argument("--generated-min-sentence-tokens", type=int, default=10)
 
     # Parent learning rates are inherited during finetuning. Weight decay and
     # the initial LR fraction use task-finetuning defaults unless overridden.
@@ -135,12 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument(
+        "--early-stopping-metric",
+        choices=("none", "validation_loss", "babilong_metric"),
+        default="validation_loss",
+        help="criterion to monitor; --early-stopping-patience=-1 disables stopping",
+    )
+    parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=-1,
         metavar="STEPS",
         help=(
-            "stop after this many training steps without validation BPB "
+            "stop after this many training steps without monitored-metric "
             "improvement (-1 disables)"
         ),
     )
@@ -148,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--early-stopping-min-delta",
         type=float,
         default=0.0,
-        help="minimum validation BPB decrease counted as an improvement",
+        help="minimum monitored-metric change counted as an improvement",
     )
     parser.add_argument("--core-metric-every", type=int, default=2000)
     parser.add_argument("--core-metric-max-per-task", type=int, default=-1)
@@ -327,9 +376,13 @@ def _update_early_stopping(
     best_step: int | None,
     patience_steps: int,
     min_delta: float,
+    maximize: bool = False,
 ) -> tuple[float, int, bool, bool]:
-    """Update best validation state and decide whether patience is exhausted."""
-    improved = best_step is None or val_bpb < best_bpb - min_delta
+    """Update a monitored metric and decide whether step patience is exhausted."""
+    if maximize:
+        improved = best_step is None or val_bpb > best_bpb + min_delta
+    else:
+        improved = best_step is None or val_bpb < best_bpb - min_delta
     if improved:
         best_bpb = val_bpb
         best_step = step
@@ -340,6 +393,69 @@ def _update_early_stopping(
         and step - best_step >= patience_steps
     )
     return best_bpb, best_step, improved, should_stop
+
+
+def _build_data_stream(
+    args,
+    tokenizer,
+    device,
+    tasks,
+    lengths,
+    split: str,
+    rank: int,
+    world_size: int,
+):
+    if args.train_data_backend == "precomputed":
+        cell_batches = args.cell_batches
+        if split == "validation":
+            cell_batches = max(1, math.ceil(args.eval_batches / len(lengths)))
+        return BABILongBatchStream(
+            tokenizer,
+            args.device_batch_size,
+            args.max_seq_len,
+            device,
+            tasks=tasks,
+            lengths=lengths,
+            dataset_name=args.train_dataset,
+            split=split,
+            validation_examples=args.validation_examples_per_cell,
+            seed=args.seed,
+            rank=rank,
+            world_size=world_size,
+            cell_batches=cell_batches,
+            oversize_policy=args.oversize_policy,
+            cache_dir=args.dataset_cache_dir,
+        )
+
+    generated_segment_size = args.segment_size
+    if generated_segment_size is None:
+        generated_segment_size = min(1024, args.max_seq_len)
+    return GeneratedBABILongBatchStream(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        generated_segment_size,
+        device,
+        tasks=tasks,
+        babi_path=args.generated_babi_path,
+        split=split,
+        noise_dataset_name=args.generated_noise_dataset,
+        noise_config_name=args.generated_noise_config,
+        noise_train_split=args.generated_noise_train_split,
+        noise_validation_split=args.generated_noise_validation_split,
+        vary_lengths=args.generated_vary_lengths and split == "train",
+        mixed_length_ratio=args.generated_mixed_length_ratio,
+        max_n_facts=args.generated_max_n_facts,
+        task_start_pct=args.generated_task_start_pct,
+        task_end_pct=args.generated_task_end_pct,
+        qa_margin=args.generated_qa_margin,
+        min_sentence_len=args.generated_min_sentence_tokens,
+        seed=args.seed,
+        rank=rank,
+        world_size=world_size,
+        oversize_policy=args.oversize_policy,
+        cache_dir=args.dataset_cache_dir,
+    )
 
 
 def main() -> None:
@@ -359,12 +475,42 @@ def main() -> None:
         parser.error("--early-stopping-patience must be -1 or non-negative")
     if args.early_stopping_min_delta < 0:
         parser.error("--early-stopping-min-delta must be non-negative")
-    if args.early_stopping_patience >= 0 and args.eval_every <= 0:
+    early_stopping_enabled = (
+        args.early_stopping_metric != "none"
+        and args.early_stopping_patience >= 0
+    )
+    if (
+        early_stopping_enabled
+        and args.early_stopping_metric == "validation_loss"
+        and args.eval_every <= 0
+    ):
         parser.error(
-            "--eval-every must be positive when early stopping is enabled"
+            "--eval-every must be positive for validation-loss early stopping"
         )
+    if (
+        early_stopping_enabled
+        and args.early_stopping_metric == "babilong_metric"
+        and args.babilong_eval_every <= 0
+    ):
+        parser.error("--babilong-eval-every must be positive for BABILong early stopping")
     if not 0.0 <= args.warmdown_ratio <= 1.0:
         parser.error("--warmdown-ratio must be between zero and one")
+    if not 0.0 <= args.generated_mixed_length_ratio <= 1.0:
+        parser.error("--generated-mixed-length-ratio must be between zero and one")
+    if args.generated_qa_margin <= 0:
+        parser.error("--generated-qa-margin must be positive")
+    if args.generated_min_sentence_tokens < 0:
+        parser.error("--generated-min-sentence-tokens must be non-negative")
+    placement = (
+        args.generated_task_start_pct,
+        args.generated_task_end_pct,
+    )
+    if (placement[0] is None) != (placement[1] is None):
+        parser.error("generated task start/end percentages must be set together")
+    if placement[0] is not None and not 0.0 <= placement[0] < placement[1] <= 1.0:
+        parser.error(
+            "generated task percentages must satisfy 0 <= start < end <= 1"
+        )
     try:
         train_tasks = parse_babilong_tasks(args.tasks)
         train_lengths = parse_babilong_lengths_train(args.lengths)
@@ -372,6 +518,15 @@ def main() -> None:
         eval_lengths = parse_babilong_lengths(args.eval_lengths or train_lengths)
     except ValueError as exc:
         parser.error(str(exc))
+    if (
+        early_stopping_enabled
+        and args.early_stopping_metric == "babilong_metric"
+        and (
+            tuple(eval_tasks) != tuple(train_tasks)
+            or tuple(eval_lengths) != tuple(train_lengths)
+        )
+    ):
+        parser.error("BABILong early stopping requires eval tasks and lengths to match training")
 
     device_type = autodetect_device_type() if not args.device_type else args.device_type
     ddp, rank, local_rank, world_size, device = compute_init(
@@ -414,7 +569,10 @@ def main() -> None:
     )
 
     orig_model = model
-    model = torch.compile(model, dynamic=False) if args.compile else model
+    compile_dynamic = (
+        args.train_data_backend == "generated" and args.generated_vary_lengths
+    )
+    model = torch.compile(model, dynamic=compile_dynamic) if args.compile else model
     num_flops_per_token = orig_model.estimate_flops()
     world_tokens_per_microbatch = args.device_batch_size * args.max_seq_len * world_size
     total_batch_size = (
@@ -461,61 +619,70 @@ def main() -> None:
         group["initial_lr"] = group["lr"]
 
     scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
-    train_stream = BABILongBatchStream(
+    train_stream = _build_data_stream(
+        args,
         tokenizer,
-        args.device_batch_size,
-        args.max_seq_len,
         device,
-        tasks=train_tasks,
-        lengths=train_lengths,
-        dataset_name=args.train_dataset,
+        train_tasks,
+        train_lengths,
         split="train",
-        validation_examples=args.validation_examples_per_cell,
-        seed=args.seed,
         rank=rank,
         world_size=world_size,
-        cell_batches=args.cell_batches,
-        oversize_policy=args.oversize_policy,
-        cache_dir=args.dataset_cache_dir,
     )
 
     def build_val_stream():
-        return BABILongBatchStream(
+        return _build_data_stream(
+            args,
             tokenizer,
-            args.device_batch_size,
-            args.max_seq_len,
             device,
-            tasks=train_tasks,
-            lengths=train_lengths,
-            dataset_name=args.train_dataset,
+            train_tasks,
+            train_lengths,
             split="validation",
-            validation_examples=args.validation_examples_per_cell,
-            seed=args.seed,
             rank=rank,
             world_size=world_size,
-            cell_batches=max(1, math.ceil(args.eval_batches / len(train_lengths))),
-            oversize_policy=args.oversize_policy,
-            cache_dir=args.dataset_cache_dir,
         )
 
+    training_lengths = (
+        list(train_lengths)
+        if args.train_data_backend == "precomputed"
+        else list(train_stream.sample_sizes)
+    )
+    training_dataset = (
+        args.train_dataset
+        if args.train_data_backend == "precomputed"
+        else {
+            "babi_path": os.path.abspath(os.path.expanduser(args.generated_babi_path)),
+            "noise_dataset": args.generated_noise_dataset,
+            "noise_config": args.generated_noise_config,
+        }
+    )
     token_bytes = get_token_bytes(device=device)
     x, y = next(train_stream)
 
     step = 0
     smooth_loss = 0.0
     total_training_time = 0.0
+    total_training_tokens = 0
     best_validation_bpb = float("inf")
     best_validation_step = None
+    best_babilong_metric = float("-inf")
+    best_babilong_step = None
     early_stopped = False
     latest_validation = None
     latest_core = None
     latest_babilong = None
     while True:
-        last_step = step == args.num_iterations
-        flops_so_far = num_flops_per_token * total_batch_size * step
+        last_step = early_stopped or step == args.num_iterations
+        flops_so_far = num_flops_per_token * total_training_tokens
 
-        if _should_evaluate(
-            step, last_step, args.eval_every, include_step_zero=True
+        if (
+            _should_evaluate(
+                step, last_step, args.eval_every, include_step_zero=True
+            )
+            and (
+                latest_validation is None
+                or latest_validation["evaluated_at_step"] != step
+            )
         ):
             model.eval()
             eval_started = time.time()
@@ -532,7 +699,12 @@ def main() -> None:
                 step,
                 best_validation_bpb,
                 best_validation_step,
-                args.early_stopping_patience,
+                (
+                    args.early_stopping_patience
+                    if early_stopping_enabled
+                    and args.early_stopping_metric == "validation_loss"
+                    else -1
+                ),
                 args.early_stopping_min_delta,
             )
             steps_since_improvement = step - best_validation_step
@@ -550,7 +722,7 @@ def main() -> None:
                 "early_stopping_triggered": stop_for_patience,
                 "batches": args.eval_batches,
                 "tasks": list(train_tasks),
-                "lengths": list(train_lengths),
+                "lengths": training_lengths,
                 "eval_time_seconds": time.time() - eval_started,
             }
             print0(f"Step {step:05d} | BABILong validation answer bpb: {val_bpb:.6f}")
@@ -567,7 +739,13 @@ def main() -> None:
                 )
             model.train()
 
-        run_core_eval = _should_evaluate(step, last_step, args.core_metric_every)
+        run_core_eval = (
+            _should_evaluate(step, last_step, args.core_metric_every)
+            and (
+                latest_core is None
+                or latest_core["evaluated_at_step"] != step
+            )
+        )
         if run_core_eval:
             model.eval()
             core_result = evaluate_core(
@@ -595,7 +773,21 @@ def main() -> None:
             })
             model.train()
 
-        run_generation_eval = _should_evaluate(step, last_step, args.babilong_eval_every)
+        run_generation_eval = (
+            _should_evaluate(
+                step,
+                last_step,
+                args.babilong_eval_every,
+                include_step_zero=(
+                    early_stopping_enabled
+                    and args.early_stopping_metric == "babilong_metric"
+                ),
+            )
+            and (
+                latest_babilong is None
+                or latest_babilong["evaluated_at_step"] != step
+            )
+        )
         if run_generation_eval:
             model.eval()
             result = evaluate_babilong(
@@ -609,8 +801,37 @@ def main() -> None:
                 dataset_name=args.eval_dataset,
                 batch_size=args.eval_batch_size,
             )
+            (
+                best_babilong_metric,
+                best_babilong_step,
+                babilong_improved,
+                patience_exhausted,
+            ) = _update_early_stopping(
+                result["babilong_metric"],
+                step,
+                best_babilong_metric,
+                best_babilong_step,
+                (
+                    args.early_stopping_patience
+                    if early_stopping_enabled
+                    and args.early_stopping_metric == "babilong_metric"
+                    else -1
+                ),
+                args.early_stopping_min_delta,
+                maximize=True,
+            )
+            babilong_steps_since_improvement = step - best_babilong_step
+            stop_for_babilong_patience = patience_exhausted and not last_step
+            if stop_for_babilong_patience:
+                early_stopped = True
+                last_step = True
             latest_babilong = {
                 "evaluated_at_step": step,
+                "is_best": babilong_improved,
+                "best_metric": best_babilong_metric,
+                "best_step": best_babilong_step,
+                "steps_since_improvement": babilong_steps_since_improvement,
+                "early_stopping_triggered": stop_for_babilong_patience,
                 "per_task_per_length_scores": result["results"],
                 "aggregated_scores": {
                     "per_task": result["task_results"],
@@ -644,9 +865,19 @@ def main() -> None:
             wandb_run.log({
                 "step": step,
                 "babilong_metric": result["babilong_metric"],
+                "babilong/best_metric": best_babilong_metric,
+                "babilong/steps_since_improvement": babilong_steps_since_improvement,
                 **babilong_log,
             })
+            if stop_for_babilong_patience:
+                print0(
+                    f"Early stopping at step {step}: BABILong metric has not "
+                    f"improved for {babilong_steps_since_improvement} steps"
+                )
             model.train()
+            if stop_for_babilong_patience:
+                # Re-enter once to run any final evaluations skipped earlier this step.
+                continue
 
         save_now = last_step or (
             step > 0 and args.save_every > 0 and step % args.save_every == 0
@@ -657,6 +888,29 @@ def main() -> None:
                 stop_reason = "early_stopping"
             else:
                 stop_reason = "iteration_limit" if last_step else None
+            if args.early_stopping_metric == "babilong_metric":
+                monitored_metric = "babilong/metric"
+                monitored_mode = "max"
+                selected_best_value = (
+                    best_babilong_metric
+                    if best_babilong_step is not None
+                    else None
+                )
+                selected_best_step = best_babilong_step
+            elif args.early_stopping_metric == "validation_loss":
+                monitored_metric = "validation/answer_bpb"
+                monitored_mode = "min"
+                selected_best_value = (
+                    best_validation_bpb
+                    if best_validation_step is not None
+                    else None
+                )
+                selected_best_step = best_validation_step
+            else:
+                monitored_metric = None
+                monitored_mode = None
+                selected_best_value = None
+                selected_best_step = None
             evaluation = {
                 "checkpoint_step": step,
                 "reproducibility": {
@@ -666,34 +920,46 @@ def main() -> None:
                 },
                 "training": {
                     "mode": args.mode,
-                    "dataset": args.train_dataset,
+                    "data_backend": args.train_data_backend,
+                    "dataset": training_dataset,
                     "tasks": list(train_tasks),
-                    "lengths": list(train_lengths),
+                    "lengths": training_lengths,
                     "requested_iterations": args.num_iterations,
                     "completed_iterations": step,
                     "stop_reason": stop_reason,
                     "total_time_seconds": total_training_time,
+                    "total_tokens": total_training_tokens,
                     "total_flops": flops_so_far,
                     "peak_memory_bytes": peak_memory,
                     "peak_memory_mib": peak_memory / (1024 * 1024),
                     "data_stream": train_stream.stats(),
                 },
                 "early_stopping": {
-                    "enabled": args.early_stopping_patience >= 0,
+                    "enabled": early_stopping_enabled,
+                    "criterion": args.early_stopping_metric,
                     "patience_steps": args.early_stopping_patience,
                     "min_delta": args.early_stopping_min_delta,
-                    "monitored_metric": "validation/answer_bpb",
+                    "mode": monitored_mode,
+                    "monitored_metric": monitored_metric,
+                    "best_value": selected_best_value,
+                    "best_step": selected_best_step,
+                    "steps_since_improvement": (
+                        None
+                        if selected_best_step is None
+                        else step - selected_best_step
+                    ),
                     "best_validation_bpb": (
                         best_validation_bpb
                         if best_validation_step is not None
                         else None
                     ),
-                    "best_step": best_validation_step,
-                    "steps_since_improvement": (
-                        None
-                        if best_validation_step is None
-                        else step - best_validation_step
+                    "best_validation_step": best_validation_step,
+                    "best_babilong_metric": (
+                        best_babilong_metric
+                        if best_babilong_step is not None
+                        else None
                     ),
+                    "best_babilong_step": best_babilong_step,
                     "stopped_early": early_stopped,
                     "stop_step": step if early_stopped else None,
                 },
@@ -732,7 +998,9 @@ def main() -> None:
 
         synchronize()
         started = time.time()
+        step_tokens = 0
         for _ in range(grad_accum_steps):
+            step_tokens += x.numel() * world_size
             loss = model(x, y)
             train_loss = loss.detach()
             scaled_loss = loss / grad_accum_steps
@@ -761,12 +1029,13 @@ def main() -> None:
         elapsed = time.time() - started
         if step > 10:
             total_training_time += elapsed
+        total_training_tokens += step_tokens
 
         loss_value = train_loss.item()
         smooth_loss = 0.9 * smooth_loss + 0.1 * loss_value
         debiased_loss = smooth_loss / (1.0 - 0.9 ** (step + 1))
-        tokens_per_second = int(total_batch_size / elapsed)
-        mfu = 100 * num_flops_per_token * total_batch_size / (
+        tokens_per_second = int(step_tokens / elapsed)
+        mfu = 100 * num_flops_per_token * step_tokens / (
             elapsed * peak_flops * world_size
         )
         print0(
@@ -794,9 +1063,12 @@ def main() -> None:
             gc.collect()
 
     if early_stopped:
-        print0(
-            f"Best validation BPB: {best_validation_bpb:.6f} at step {best_validation_step}"
-        )
+        if args.early_stopping_metric == "babilong_metric":
+            print0(
+                f"Best BABILong metric: {best_babilong_metric:.6f} at step {best_babilong_step}"
+            )
+        else:
+            print0(f"Best validation BPB: {best_validation_bpb:.6f} at step {best_validation_step}")
     print0(f"Saved BABILong-trained checkpoint to {checkpoint_dir}")
     print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
     print0(f"Total training time: {total_training_time / 60:.2f}m")

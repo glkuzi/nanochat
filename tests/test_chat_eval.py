@@ -1,5 +1,6 @@
 """Focused tests for GPT/ARMT chat evaluation forwarding."""
 
+import csv
 import torch
 
 from scripts import chat_eval as chat_eval_module
@@ -105,6 +106,57 @@ def test_chat_babilong_eval_passes_gpt_and_armt_to_shared_evaluator(monkeypatch)
             "max_new_tokens": 10,
             "batch_size": 8,
             "dataset_name": "test/babilong",
+            "example_callback": None,
         }
         for call in calls
     )
+
+
+def test_chat_babilong_eval_saves_one_csv_per_cell(monkeypatch, tmp_path):
+    expected = {
+        "results": {"qa1": {"2k": 1.0}},
+        "task_results": {"qa1": 1.0},
+        "length_results": {"2k": 1.0},
+        "babilong_metric": 1.0,
+    }
+    record = {
+        "input_context": "Mary moved to the kitchen.\nJohn stayed outside.",
+        "input_question": "Where is Mary?",
+        "generated_answer": "The answer is kitchen.",
+        "ground_truth_answer": "kitchen",
+        "answers_matched": True,
+    }
+
+    def fake_evaluate(model, tokenizer, device, **kwargs):
+        kwargs["example_callback"]("qa1", "2k", [record])
+        return expected
+
+    monkeypatch.setattr(chat_eval_module, "evaluate_babilong", fake_evaluate)
+    result = run_chat_babilong_eval(
+        GPTModel(),
+        object(),
+        torch.device("cpu"),
+        tasks=("qa1",),
+        lengths=("2k",),
+        results_dir=str(tmp_path),
+    )
+
+    assert result is expected
+    with open(tmp_path / "qa1_2k.csv", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        assert tuple(reader.fieldnames) == chat_eval_module.BABILONG_CSV_FIELDS
+        assert list(reader) == [{**record, "answers_matched": "True"}]
+
+
+def test_default_babilong_results_dir_is_checkpoint_specific():
+    path = chat_eval_module.resolve_babilong_results_dir(
+        None,
+        "/cache/nanochat",
+        "sft",
+        None,
+        None,
+        {"step": 17, "user_config": {"output_model_tag": "armt/d12"}},
+        "armt",
+    )
+
+    assert path == "/cache/nanochat/chat_eval_results/sft/armt_d12/step_17/babilong"

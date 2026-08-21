@@ -106,3 +106,24 @@ def test_padded_mixed_length_forward_matches_independent_rows():
                 atol=1e-5,
                 rtol=1e-4,
             )
+
+
+def test_loaded_context_length_can_shrink_or_grow_without_nan():
+    torch.manual_seed(9876)
+    model = _build_armt(sequence_len=16, segment_size=4, num_mem_tokens=2)
+
+    model.set_sequence_len(8)
+    assert model.config.sequence_len == 8
+    assert model.window_sizes[-1] == (8, 0)
+    x = torch.randint(0, model.config.vocab_size, (2, 8), dtype=torch.int32)
+    targets = torch.randint(0, model.config.vocab_size, (2, 8))
+    assert torch.isfinite(model(x, targets))
+
+    # The original cache has 160 positions. Absolute ARMT positions at this
+    # length need 201 positions, so this also exercises dynamic cache growth.
+    model.set_sequence_len(133)
+    assert model.config.sequence_len == 133
+    assert model.cos.size(1) >= model._required_rotary_positions(133)
+    x = torch.randint(0, model.config.vocab_size, (1, 17), dtype=torch.int32)
+    targets = torch.randint(0, model.config.vocab_size, (1, 17))
+    assert torch.isfinite(model(x, targets))

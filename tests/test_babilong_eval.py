@@ -80,6 +80,7 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
         for i in range(10)
     ]
     observed_batch_sizes = []
+    observed_cells = {}
 
     def dataset_loader(repo_id, subset, split):
         assert repo_id == "test/babilong"
@@ -93,6 +94,9 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
         observed_batch_sizes.append(len(prompts))
         return ["The answer is KITCHEN."] * len(prompts)
 
+    def example_callback(task, length, records):
+        observed_cells[(task, length)] = records
+
     result = evaluate_babilong(
         model=object(),
         tokenizer=object(),
@@ -102,6 +106,7 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
         dataset_name="test/babilong",
         dataset_loader=dataset_loader,
         generation_fn=generation_fn,
+        example_callback=example_callback,
     )
 
     assert result["results"] == {
@@ -114,6 +119,18 @@ def test_evaluate_babilong_returns_all_aggregation_levels():
     assert result["example_counts"]["qa1"]["0k"] == 10
     assert result["batch_size"] == 8
     assert observed_batch_sizes == [8, 2] * 4
+    assert set(observed_cells) == {
+        ("qa1", "0k"), ("qa1", "1k"),
+        ("qa2", "0k"), ("qa2", "1k"),
+    }
+    first_record = observed_cells[("qa1", "0k")][0]
+    assert first_record == {
+        "input_context": "Person 0 moved to the kitchen.",
+        "input_question": "Where is person 0?",
+        "generated_answer": "The answer is KITCHEN.",
+        "ground_truth_answer": "kitchen",
+        "answers_matched": True,
+    }
     timing = result["eval_time"]
     assert set(timing["per_task_per_length_seconds"]) == {"qa1", "qa2"}
     assert set(timing["per_task_seconds"]) == {"qa1", "qa2"}

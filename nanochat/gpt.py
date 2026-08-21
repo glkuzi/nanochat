@@ -301,6 +301,32 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
+    def _required_rotary_positions(self, sequence_len):
+        """Number of RoPE positions needed for ``sequence_len`` real tokens."""
+        return sequence_len
+
+    @torch.no_grad()
+    def set_sequence_len(self, sequence_len):
+        """Apply a runtime context length and grow the RoPE cache if necessary.
+
+        Checkpoint weights do not depend on context length. This method keeps the
+        live attention windows and non-persistent rotary cache consistent when a
+        loaded model is trained or evaluated with a different sequence length.
+        """
+        if not isinstance(sequence_len, int) or isinstance(sequence_len, bool) or sequence_len <= 0:
+            raise ValueError("sequence_len must be a positive integer")
+
+        self.config.sequence_len = sequence_len
+        self.window_sizes = self._compute_window_sizes(self.config)
+        required_positions = self._required_rotary_positions(sequence_len)
+        if required_positions > self.cos.size(1):
+            self.rotary_seq_len = max(sequence_len * 10, required_positions)
+            head_dim = self.config.n_embd // self.config.n_head
+            self.cos, self.sin = self._precompute_rotary_embeddings(
+                self.rotary_seq_len, head_dim
+            )
+        return self
+
     def _compute_window_sizes(self, config):
         """
         Compute per-layer window sizes for sliding window attention.

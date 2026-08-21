@@ -10,7 +10,10 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy --eval ch
 """
 
 import argparse
+import csv
 from functools import partial
+import os
+import re
 import torch
 import torch.distributed as dist
 
@@ -23,6 +26,7 @@ from nanochat.babilong_eval import (
     parse_babilong_tasks,
 )
 from nanochat.checkpoint_manager import load_model
+from nanochat.common import get_base_dir
 from nanochat.engine import Engine
 
 from tasks.humaneval import HumanEval
@@ -207,6 +211,70 @@ def parse_eval_modes(value):
     return modes
 
 
+BABILONG_CSV_FIELDS = (
+    "input_context",
+    "input_question",
+    "generated_answer",
+    "ground_truth_answer",
+    "answers_matched",
+)
+
+
+def _safe_path_component(value):
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return component or "model"
+
+
+def resolve_babilong_results_dir(
+    requested_dir,
+    base_dir,
+    source,
+    model_tag,
+    step,
+    meta,
+    model_type,
+):
+    """Resolve an explicit directory or a stable checkpoint-specific default."""
+    if requested_dir:
+        return os.path.abspath(os.path.expanduser(requested_dir))
+    user_config = meta.get("user_config", {})
+    resolved_tag = (
+        model_tag
+        or user_config.get("output_model_tag")
+        or user_config.get("model_tag")
+        or model_type
+    )
+    resolved_step = step if step is not None else meta.get("step", "latest")
+    return os.path.join(
+        base_dir,
+        "chat_eval_results",
+        _safe_path_component(source),
+        _safe_path_component(resolved_tag),
+        f"step_{_safe_path_component(resolved_step)}",
+        "babilong",
+    )
+
+
+def save_babilong_cell_csv(output_dir, task, length, records):
+    """Atomically save one BABILong task-length cell as UTF-8 CSV."""
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"{_safe_path_component(task)}_{_safe_path_component(length)}.csv"
+    output_path = os.path.join(output_dir, filename)
+    temporary_path = f"{output_path}.tmp"
+    with open(
+        temporary_path, "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=BABILONG_CSV_FIELDS,
+        )
+        writer.writeheader()
+        writer.writerows(records)
+    os.replace(temporary_path, output_path)
+    print0(f"Saved BABILong examples: {output_path}")
+    return output_path
+
+
 def run_chat_babilong_eval(
     model,
     tokenizer,
@@ -217,8 +285,14 @@ def run_chat_babilong_eval(
     max_new_tokens=20,
     batch_size=DEFAULT_BABILONG_BATCH_SIZE,
     dataset_name=BABILONG_DATASET,
+    results_dir=None,
 ):
     """Evaluate BABILong for either GPT or ARMT and print all aggregates."""
+    example_callback = (
+        partial(save_babilong_cell_csv, results_dir)
+        if results_dir is not None
+        else None
+    )
     result = evaluate_babilong(
         model,
         tokenizer,
@@ -229,6 +303,7 @@ def run_chat_babilong_eval(
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
         dataset_name=dataset_name,
+        example_callback=example_callback,
     )
     print0("\nBABILong task aggregates:")
     for task, score in result["task_results"].items():
@@ -237,6 +312,8 @@ def run_chat_babilong_eval(
     for length, score in result["length_results"].items():
         print0(f"  {length}: {score:.4f}")
     print0(f"BABILong metric: {result['babilong_metric']:.4f}")
+    if results_dir is not None:
+        print0(f"BABILong example CSV directory: {results_dir}")
     return result
 
 # -----------------------------------------------------------------------------
@@ -272,6 +349,10 @@ if __name__ == "__main__":
     parser.add_argument('--babilong-max-new-tokens', type=int, default=20, choices=range(10, 31), metavar='N', help='Greedy BABILong generation budget from 10 to 30 tokens (default: 20)')
     parser.add_argument('--babilong-batch-size', type=int, default=DEFAULT_BABILONG_BATCH_SIZE, help='Per-device BABILong generation batch size (default: 8)')
     parser.add_argument('--babilong-dataset', type=str, default=BABILONG_DATASET, help='Hugging Face BABILong dataset repository')
+    parser.add_argument(
+        '--babilong-results-dir', type=str, default=None,
+        help='Directory for per-task-length BABILong CSV files (default: checkpoint-specific cache directory)',
+    )
     parser.add_argument('--seed', type=int, default=42, help='Global Python/NumPy/PyTorch seed (default: 42)')
     parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=True, help='Require deterministic algorithms (default: enabled)')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
@@ -339,6 +420,15 @@ if __name__ == "__main__":
 
     # BABILong is reported separately and never contributes to ChatCORE.
     if 'babilong' in eval_modes:
+        babilong_results_dir = resolve_babilong_results_dir(
+            args.babilong_results_dir,
+            get_base_dir(),
+            args.source,
+            args.model_tag,
+            args.step,
+            meta,
+            loaded_model_type,
+        )
         print0("\n" + "=" * 50)
         print0("BABILong Evaluation")
         print0("=" * 50)
@@ -354,6 +444,7 @@ if __name__ == "__main__":
             max_new_tokens=args.babilong_max_new_tokens,
             batch_size=args.babilong_batch_size,
             dataset_name=args.babilong_dataset,
+            results_dir=babilong_results_dir,
         )
 
     compute_cleanup()
