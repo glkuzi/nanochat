@@ -56,9 +56,11 @@ def _resolve_dtype(value: str | torch.dtype) -> torch.dtype:
 class ARMTGPTConfig(GPTConfig):
     """GPT architecture settings plus nanochat-specific ARMT settings.
 
-    ``sequence_len`` is the maximum number of real tokens; inserted memory and
-    sink tokens do not consume that budget. ``n_heads`` refers to associative
-    memory heads and is independent of GPT's attention ``n_head``.
+    ``sequence_len`` is a runtime planning hint used to initialize attention
+    windows and the RoPE cache, not a hard maximum. ARMT can process longer
+    inputs recurrently and grows its non-persistent RoPE cache when needed.
+    ``n_heads`` refers to associative memory heads and is independent of GPT's
+    attention ``n_head``.
     """
 
     num_mem_tokens: int = 16
@@ -341,6 +343,12 @@ class ARMTGPT(GPT):
         super().__init__(config, pad_vocab_size_to=pad_vocab_size_to)
         self.config = config
         self.memory_dtype = _resolve_dtype(config.memory_dtype)
+        # Base GPT reserves 10x the configured context. ARMT is expected to run
+        # at much larger recurrent lengths, so initialize only the positions it
+        # actually needs and grow this non-persistent cache on demand.
+        self.rotary_seq_len = self._required_rotary_positions(config.sequence_len)
+        head_dim = config.n_embd // config.n_head
+        self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.wrap_layers = tuple(config.wrap_layers or (1,) * config.n_layer)
 
         self.memory = nn.Parameter(
@@ -403,6 +411,36 @@ class ARMTGPT(GPT):
             return min(sequence_len, self.config.segment_size) + extra_tokens
         num_segments = math.ceil(sequence_len / self.config.segment_size)
         return sequence_len + num_segments * extra_tokens
+
+    @torch.no_grad()
+    def _ensure_rotary_capacity(self, sequence_len: int) -> None:
+        """Grow the runtime RoPE cache for an arbitrary real-token length."""
+        required_positions = self._required_rotary_positions(sequence_len)
+        if required_positions <= self.cos.size(1):
+            return
+        self.rotary_seq_len = max(
+            required_positions,
+            max(1, self.cos.size(1) * 2),
+        )
+        head_dim = self.config.n_embd // self.config.n_head
+        self.cos, self.sin = self._precompute_rotary_embeddings(
+            self.rotary_seq_len, head_dim
+        )
+
+    @torch.no_grad()
+    def set_sequence_len(self, sequence_len: int):
+        """Set the planned context without imposing a hard input maximum."""
+        if (
+            not isinstance(sequence_len, int)
+            or isinstance(sequence_len, bool)
+            or sequence_len <= 0
+        ):
+            raise ValueError("sequence_len must be a positive integer")
+
+        self.config.sequence_len = sequence_len
+        self.window_sizes = self._compute_window_sizes(self.config)
+        self._ensure_rotary_capacity(sequence_len)
+        return self
 
     @torch.no_grad()
     def init_weights(self) -> None:
@@ -593,12 +631,8 @@ class ARMTGPT(GPT):
         if idx.device != self.cos.device:
             raise ValueError("idx and rotary embeddings must be on the same device")
 
+        self._ensure_rotary_capacity(int(sequence_lengths.max().item()))
         segment_lengths, valid_mask, position_ids = self._padded_layout(sequence_lengths)
-        max_position = int(position_ids.max().item()) + 1
-        if max_position > self.cos.size(1):
-            raise ValueError(
-                f"ARMT augmented position {max_position} exceeds RoPE cache size {self.cos.size(1)}"
-            )
         x = norm(self.transformer.wte(idx).to(COMPUTE_DTYPE))
         if idx.size(1) > 1:
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
@@ -660,6 +694,7 @@ class ARMTGPT(GPT):
         return softcap * torch.tanh(logits / softcap)
 
     def _armt_cos_sin(self, real_seq_len: int, device: torch.device):
+        self._ensure_rotary_capacity(real_seq_len)
         real_lengths = [
             min(self.config.segment_size, real_seq_len - start)
             for start in range(0, real_seq_len, self.config.segment_size)
@@ -673,16 +708,6 @@ class ARMTGPT(GPT):
             positions.append(torch.arange(start, start + augmented_length, device=device))
             absolute_start += augmented_length
         position_ids = torch.cat(positions).long()
-        num_segments = len(real_lengths)
-        if self.config.segment_position_mode == "reset":
-            max_position = max(real_lengths) + extra_tokens
-        else:
-            max_position = real_seq_len + num_segments * extra_tokens
-        if max_position > self.cos.size(1):
-            raise ValueError(
-                f"ARMT augmented position {max_position} exceeds RoPE cache size {self.cos.size(1)}; "
-                "increase GPTConfig.sequence_len or reduce inserted memory tokens"
-            )
         return self.cos.index_select(1, position_ids), self.sin.index_select(1, position_ids)
 
     def _forward_full(self, idx: torch.Tensor, targets=None, loss_reduction: str = "mean"):
@@ -691,8 +716,6 @@ class ARMTGPT(GPT):
         batch_size, seq_len = idx.shape
         if seq_len == 0:
             raise ValueError("ARMTGPT cannot process an empty sequence")
-        #if seq_len > self.config.sequence_len:
-        #    raise ValueError(f"Sequence length {seq_len} exceeds configured maximum {self.config.sequence_len}")
         if idx.device != self.cos.device:
             raise ValueError(f"Rotary embeddings and idx are on different devices: {self.cos.device} and {idx.device}")
         if self.cos.dtype != COMPUTE_DTYPE:

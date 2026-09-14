@@ -285,6 +285,14 @@ class GPT(nn.Module):
                 ve.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
+        # A cache grown during evaluation outlives inference_mode and is reused
+        # by later training. Build it as a normal no-grad tensor so autograd may
+        # save it for backward.
+        if torch.is_inference_mode_enabled():
+            with torch.inference_mode(False), torch.no_grad():
+                return self._precompute_rotary_embeddings(
+                    seq_len, head_dim, base=base, device=device
+                )
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:

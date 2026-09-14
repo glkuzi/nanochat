@@ -372,6 +372,15 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokeniz
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
+debug = False
+######### DEBUG ##################
+if debug:
+    print(x)
+    print(y)
+    print(x[0])
+    print(x[0].shape)
+    print0(tokenizer.decode(x[0].detach().cpu().numpy()))
+    print0(tokenizer.decode(x[1].detach().cpu().numpy()))
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
 
@@ -664,6 +673,7 @@ while True:
         #    print0(y.shape)
         #    print0(x)
         #    print0(y)
+        #    print0(tokenizer.decode(x[0].detach().cpu().numpy()))
         loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here

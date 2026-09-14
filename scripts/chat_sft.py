@@ -32,6 +32,7 @@ from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
+from tasks.smoltalk_full import SmolTalkFull
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -58,7 +59,14 @@ parser.add_argument(
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
-parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
+parser.add_argument(
+    "--max-seq-len",
+    "--sequence-len",
+    dest="max_seq_len",
+    type=int,
+    default=None,
+    help="SFT sample length; explicitly overrides the loaded checkpoint context",
+)
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
 # ARMT options are used only when wrapping a plain GPT checkpoint.
@@ -91,6 +99,8 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--use-full-smoltalk", action="store_true")
+
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -166,6 +176,8 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
+if args.max_seq_len <= 1:
+    parser.error("--max-seq-len must be greater than one")
 orig_model = model
 orig_model.set_sequence_len(args.max_seq_len)
 checkpoint_model_config = asdict(orig_model.config)
@@ -224,14 +236,14 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 train_tasks = [
-    SmolTalk(split="train"), # 460K rows of general conversations
+    SmolTalk(split="train") if not(args.use_full_smoltalk) else SmolTalkFull(split="train"), # 460K rows of general conversations
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
 ]
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
 val_dataset = TaskMixture([
-    SmolTalk(split="test"), # 24K rows in test set
+    SmolTalk(split="test") if not(args.use_full_smoltalk) else SmolTalkFull(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
@@ -405,6 +417,14 @@ def get_muon_momentum(it):
 # -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
+debug = False
+if debug:
+    print(x)
+    print(y)
+    print(x[0])
+    print(x[0].shape)
+    print0(tokenizer.decode(x[0].detach().cpu().numpy()))
+    print0(tokenizer.decode(x[1].detach().cpu().numpy()))
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor

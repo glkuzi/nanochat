@@ -13,6 +13,12 @@ Examples (run from the nanochat repository root):
     # Load a pretrained GPT, add ARMT, and finetune the resulting ARMTGPT.
     python -m scripts.babilong_train --mode finetune --model-type armt \
         --input-model-tag gpt_d4_with_bl --output-model-tag armt_d4_babilong
+
+    # Continue a pretrained 2K ARMT checkpoint with 8K BABILong samples.
+    # The recurrent segment size remains the checkpoint's original value.
+    python -m scripts.babilong_train --mode finetune --model-type armt \
+        --input-model-tag armt_d4_2k --max-seq-len 8192 \
+        --output-model-tag armt_d4_babilong_8k
 """
 
 from __future__ import annotations
@@ -45,7 +51,12 @@ from nanochat.babilong_generated_data import (
     DEFAULT_BABILONG_NOISE_DATASET,
     GeneratedBABILongBatchStream,
 )
-from nanochat.checkpoint_manager import load_model, load_optimizer_state, save_checkpoint
+from nanochat.checkpoint_manager import (
+    load_checkpoint,
+    load_model,
+    load_optimizer_state,
+    save_checkpoint,
+)
 from nanochat.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
@@ -118,7 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tasks", default="qa1-qa5")
     parser.add_argument("--lengths", default="0k-8k")
-    parser.add_argument("--max-seq-len", type=int, default=8192)
+    parser.add_argument(
+        "--max-seq-len",
+        "--sequence-len",
+        dest="max_seq_len",
+        type=int,
+        default=8192,
+        help=(
+            "training sample length; explicitly overrides a loaded "
+            "checkpoint context"
+        ),
+    )
     parser.add_argument("--device-batch-size", type=int, default=1)
     parser.add_argument(
         "--total-batch-size",
@@ -197,7 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--early-stopping-min-delta",
         type=float,
         default=0.0,
-        help="minimum monitored-metric change counted as an improvement",
+        help=(
+            "minimum monitored-metric change that resets patience; for BABILong, "
+            "values greater than 1 are percentage points (5 means 0.05)"
+        ),
     )
     parser.add_argument("--core-metric-every", type=int, default=2000)
     parser.add_argument("--core-metric-max-per-task", type=int, default=-1)
@@ -328,22 +352,15 @@ def _load_finetune_model(args, device) -> tuple[GPT, object, dict, bool]:
     return model, tokenizer, meta, wrapped_gpt
 
 
-def _ensure_rotary_capacity(model: GPT, real_tokens: int) -> None:
-    required = real_tokens
-    if isinstance(model, ARMTGPT):
-        extras = model.config.num_mem_tokens + int(model.config.use_sink)
-        if model.config.segment_position_mode == "reset":
-            required = min(real_tokens, model.config.segment_size) + extras
-        else:
-            required = real_tokens + math.ceil(real_tokens / model.config.segment_size) * extras
-    if required <= model.cos.size(1):
-        return
-    new_size = max(required, model.cos.size(1) * 2)
-    head_dim = model.config.n_embd // model.config.n_head
-    cos, sin = model._precompute_rotary_embeddings(new_size, head_dim)
-    model.cos, model.sin = cos, sin
-    model.rotary_seq_len = new_size
-    print0(f"Extended rotary cache to {new_size:,} positions for training")
+def _set_training_sequence_len(model: GPT, sequence_len: int) -> None:
+    """Apply the data length independently of the checkpoint's saved context."""
+    previous = model.config.sequence_len
+    model.set_sequence_len(sequence_len)
+    if sequence_len != previous:
+        print0(
+            "Changed runtime sequence length from checkpoint value "
+            f"{previous:,} to {sequence_len:,}"
+        )
 
 
 def _lr_multiplier(args, step: int) -> float:
@@ -393,6 +410,94 @@ def _update_early_stopping(
         and step - best_step >= patience_steps
     )
     return best_bpb, best_step, improved, should_stop
+
+
+def _update_early_stopping_state(
+    metric_value: float,
+    step: int,
+    best_value: float,
+    best_step: int | None,
+    patience_value: float,
+    patience_step: int | None,
+    patience_steps: int,
+    min_delta: float,
+    maximize: bool = False,
+) -> tuple[float, int, float, int, bool, bool, bool]:
+    """Track the absolute best separately from the patience reference."""
+
+    def improved_over(value: float, reference: float, delta: float) -> bool:
+        if maximize:
+            return value > reference + delta
+        return value < reference - delta
+
+    is_best = best_step is None or improved_over(metric_value, best_value, 0.0)
+    if is_best:
+        best_value = metric_value
+        best_step = step
+
+    significant_improvement = (
+        patience_step is None
+        or improved_over(metric_value, patience_value, min_delta)
+    )
+    if significant_improvement:
+        patience_value = metric_value
+        patience_step = step
+
+    assert best_step is not None
+    assert patience_step is not None
+    should_stop = (
+        patience_steps >= 0
+        and not significant_improvement
+        and step - patience_step >= patience_steps
+    )
+    return (
+        best_value,
+        best_step,
+        patience_value,
+        patience_step,
+        is_best,
+        significant_improvement,
+        should_stop,
+    )
+
+
+def _resolve_early_stopping_min_delta(metric: str, min_delta: float) -> float:
+    """Normalize BABILong percentage-point tolerances to its [0, 1] scale."""
+    if min_delta < 0:
+        raise ValueError("--early-stopping-min-delta must be non-negative")
+    if metric == "babilong_metric" and min_delta > 1.0:
+        if min_delta > 100.0:
+            raise ValueError(
+                "--early-stopping-min-delta cannot exceed 100 percentage points "
+                "for BABILong"
+            )
+        return min_delta / 100.0
+    return min_delta
+
+
+def _restore_training_checkpoint(
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: str,
+    device: torch.device,
+    rank: int,
+) -> int:
+    """Restore model and optimizer state and return its actual training step."""
+    model_data, optimizer_data, meta = load_checkpoint(
+        checkpoint_dir,
+        0,
+        device,
+        load_optimizer=True,
+        rank=rank,
+    )
+    model_data = {
+        key.removeprefix("_orig_mod."): value for key, value in model_data.items()
+    }
+    model.load_state_dict(model_data, strict=True)
+    if optimizer_data is None:
+        raise RuntimeError(f"Best optimizer snapshot is missing in {checkpoint_dir}")
+    optimizer.load_state_dict(optimizer_data)
+    return int(meta["step"])
 
 
 def _build_data_stream(
@@ -473,8 +578,13 @@ def main() -> None:
         parser.error("--eval-batches must be positive when validation is enabled")
     if args.early_stopping_patience < -1:
         parser.error("--early-stopping-patience must be -1 or non-negative")
-    if args.early_stopping_min_delta < 0:
-        parser.error("--early-stopping-min-delta must be non-negative")
+    requested_early_stopping_min_delta = args.early_stopping_min_delta
+    try:
+        effective_early_stopping_min_delta = _resolve_early_stopping_min_delta(
+            args.early_stopping_metric, requested_early_stopping_min_delta
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     early_stopping_enabled = (
         args.early_stopping_metric != "none"
         and args.early_stopping_patience >= 0
@@ -523,10 +633,16 @@ def main() -> None:
         and args.early_stopping_metric == "babilong_metric"
         and (
             tuple(eval_tasks) != tuple(train_tasks)
-            or tuple(eval_lengths) != tuple(train_lengths)
+            or (
+                args.train_data_backend == "precomputed"
+                and tuple(eval_lengths) != tuple(train_lengths)
+            )
         )
     ):
-        parser.error("BABILong early stopping requires eval tasks and lengths to match training")
+        parser.error(
+            "BABILong early stopping requires eval tasks to match training; "
+            "precomputed training also requires matching lengths"
+        )
 
     device_type = autodetect_device_type() if not args.device_type else args.device_type
     ddp, rank, local_rank, world_size, device = compute_init(
@@ -540,6 +656,13 @@ def main() -> None:
     else:
         peak_flops = float("inf")
     print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
+    if effective_early_stopping_min_delta != requested_early_stopping_min_delta:
+        print0(
+            "Interpreting BABILong early-stopping min delta "
+            f"{requested_early_stopping_min_delta:g} as "
+            f"{effective_early_stopping_min_delta:g} "
+            f"({requested_early_stopping_min_delta:g} percentage points)"
+        )
 
     parent_meta = None
     wrapped_gpt = False
@@ -552,7 +675,7 @@ def main() -> None:
     else:
         model, tokenizer, parent_meta, wrapped_gpt = _load_finetune_model(args, device)
     _resolve_hyperparameters(args, parent_meta)
-    _ensure_rotary_capacity(model, args.max_seq_len)
+    _set_training_sequence_len(model, args.max_seq_len)
 
     if args.output_model_tag is None:
         args.output_model_tag = f"babilong_{args.model_type}_{args.mode}"
@@ -562,6 +685,7 @@ def main() -> None:
     checkpoint_dir = os.path.join(
         get_base_dir(), "base_checkpoints", args.output_model_tag
     )
+    best_checkpoint_dir = os.path.join(checkpoint_dir, "best")
 
     use_dummy_wandb = args.run == "dummy" or not master_process
     wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
@@ -665,14 +789,23 @@ def main() -> None:
     total_training_tokens = 0
     best_validation_bpb = float("inf")
     best_validation_step = None
+    validation_patience_bpb = float("inf")
+    validation_patience_step = None
     best_babilong_metric = float("-inf")
     best_babilong_step = None
+    babilong_patience_metric = float("-inf")
+    babilong_patience_step = None
     early_stopped = False
+    restored_best_weights = False
+    restored_best_step = None
     latest_validation = None
     latest_core = None
     latest_babilong = None
     while True:
         last_step = early_stopped or step == args.num_iterations
+        save_best_snapshot = False
+        best_snapshot_value = None
+        finalize_after_babilong_stop = False
         flops_so_far = num_flops_per_token * total_training_tokens
 
         if (
@@ -692,22 +825,34 @@ def main() -> None:
             (
                 best_validation_bpb,
                 best_validation_step,
-                validation_improved,
+                validation_patience_bpb,
+                validation_patience_step,
+                validation_is_best,
+                validation_significant_improvement,
                 patience_exhausted,
-            ) = _update_early_stopping(
+            ) = _update_early_stopping_state(
                 val_bpb,
                 step,
                 best_validation_bpb,
                 best_validation_step,
+                validation_patience_bpb,
+                validation_patience_step,
                 (
                     args.early_stopping_patience
                     if early_stopping_enabled
                     and args.early_stopping_metric == "validation_loss"
                     else -1
                 ),
-                args.early_stopping_min_delta,
+                effective_early_stopping_min_delta,
             )
-            steps_since_improvement = step - best_validation_step
+            steps_since_improvement = step - validation_patience_step
+            if (
+                validation_is_best
+                and early_stopping_enabled
+                and args.early_stopping_metric == "validation_loss"
+            ):
+                save_best_snapshot = True
+                best_snapshot_value = val_bpb
             stop_for_patience = patience_exhausted and not last_step
             if stop_for_patience:
                 early_stopped = True
@@ -715,9 +860,12 @@ def main() -> None:
             latest_validation = {
                 "evaluated_at_step": step,
                 "scores": {"answer_bpb": val_bpb},
-                "is_best": validation_improved,
+                "is_best": validation_is_best,
+                "significant_improvement": validation_significant_improvement,
                 "best_answer_bpb": best_validation_bpb,
                 "best_step": best_validation_step,
+                "patience_reference_bpb": validation_patience_bpb,
+                "patience_reference_step": validation_patience_step,
                 "steps_since_improvement": steps_since_improvement,
                 "early_stopping_triggered": stop_for_patience,
                 "batches": args.eval_batches,
@@ -804,32 +952,47 @@ def main() -> None:
             (
                 best_babilong_metric,
                 best_babilong_step,
-                babilong_improved,
+                babilong_patience_metric,
+                babilong_patience_step,
+                babilong_is_best,
+                babilong_significant_improvement,
                 patience_exhausted,
-            ) = _update_early_stopping(
+            ) = _update_early_stopping_state(
                 result["babilong_metric"],
                 step,
                 best_babilong_metric,
                 best_babilong_step,
+                babilong_patience_metric,
+                babilong_patience_step,
                 (
                     args.early_stopping_patience
                     if early_stopping_enabled
                     and args.early_stopping_metric == "babilong_metric"
                     else -1
                 ),
-                args.early_stopping_min_delta,
+                effective_early_stopping_min_delta,
                 maximize=True,
             )
-            babilong_steps_since_improvement = step - best_babilong_step
+            babilong_steps_since_improvement = step - babilong_patience_step
+            if (
+                babilong_is_best
+                and early_stopping_enabled
+                and args.early_stopping_metric == "babilong_metric"
+            ):
+                save_best_snapshot = True
+                best_snapshot_value = result["babilong_metric"]
             stop_for_babilong_patience = patience_exhausted and not last_step
             if stop_for_babilong_patience:
                 early_stopped = True
                 last_step = True
             latest_babilong = {
                 "evaluated_at_step": step,
-                "is_best": babilong_improved,
+                "is_best": babilong_is_best,
+                "significant_improvement": babilong_significant_improvement,
                 "best_metric": best_babilong_metric,
                 "best_step": best_babilong_step,
+                "patience_reference_metric": babilong_patience_metric,
+                "patience_reference_step": babilong_patience_step,
                 "steps_since_improvement": babilong_steps_since_improvement,
                 "early_stopping_triggered": stop_for_babilong_patience,
                 "per_task_per_length_scores": result["results"],
@@ -876,13 +1039,76 @@ def main() -> None:
                 )
             model.train()
             if stop_for_babilong_patience:
-                # Re-enter once to run any final evaluations skipped earlier this step.
-                continue
+                finalize_after_babilong_stop = True
+
+        if save_best_snapshot:
+            best_snapshot_eval = {
+                "training_step": step,
+                "criterion": args.early_stopping_metric,
+                "value": best_snapshot_value,
+                "requested_min_delta": requested_early_stopping_min_delta,
+                "effective_min_delta": effective_early_stopping_min_delta,
+            }
+            save_checkpoint(
+                best_checkpoint_dir,
+                0,
+                orig_model.state_dict(),
+                optimizer.state_dict(),
+                {
+                    # The file uses a fixed slot so only one large best snapshot
+                    # is retained. This field records its actual training step.
+                    "step": step,
+                    "model_config": model_config,
+                    "user_config": user_config,
+                    "device_batch_size": args.device_batch_size,
+                    "max_seq_len": args.max_seq_len,
+                    "total_batch_size": total_batch_size,
+                    "best_snapshot": best_snapshot_eval,
+                },
+                rank=rank,
+                eval_data=best_snapshot_eval,
+            )
+            if is_ddp_initialized():
+                dist.barrier()
+            print0(
+                f"Saved new best {args.early_stopping_metric} checkpoint "
+                f"from step {step} to {best_checkpoint_dir}"
+            )
+
+        if finalize_after_babilong_stop:
+            # Re-enter once to run any final evaluations skipped earlier this
+            # step. The new best snapshot above must be saved before doing so.
+            continue
 
         save_now = last_step or (
             step > 0 and args.save_every > 0 and step % args.save_every == 0
         )
         if save_now:
+            selected_best_step_for_restore = (
+                best_babilong_step
+                if args.early_stopping_metric == "babilong_metric"
+                else best_validation_step
+            )
+            if (
+                last_step
+                and early_stopping_enabled
+                and selected_best_step_for_restore is not None
+                and not restored_best_weights
+            ):
+                if is_ddp_initialized():
+                    dist.barrier()
+                restored_best_step = _restore_training_checkpoint(
+                    orig_model,
+                    optimizer,
+                    best_checkpoint_dir,
+                    device,
+                    rank,
+                )
+                restored_best_weights = True
+                print0(
+                    f"Restored best {args.early_stopping_metric} weights "
+                    f"from step {restored_best_step} for the final checkpoint"
+                )
             peak_memory = int(get_max_memory())
             if early_stopped:
                 stop_reason = "early_stopping"
@@ -897,6 +1123,8 @@ def main() -> None:
                     else None
                 )
                 selected_best_step = best_babilong_step
+                selected_patience_value = babilong_patience_metric
+                selected_patience_step = babilong_patience_step
             elif args.early_stopping_metric == "validation_loss":
                 monitored_metric = "validation/answer_bpb"
                 monitored_mode = "min"
@@ -906,13 +1134,18 @@ def main() -> None:
                     else None
                 )
                 selected_best_step = best_validation_step
+                selected_patience_value = validation_patience_bpb
+                selected_patience_step = validation_patience_step
             else:
                 monitored_metric = None
                 monitored_mode = None
                 selected_best_value = None
                 selected_best_step = None
+                selected_patience_value = None
+                selected_patience_step = None
             evaluation = {
                 "checkpoint_step": step,
+                "checkpoint_weights_step": restored_best_step if restored_best_weights else step,
                 "reproducibility": {
                     "seed": args.seed,
                     "deterministic_algorithms": args.deterministic,
@@ -938,16 +1171,22 @@ def main() -> None:
                     "enabled": early_stopping_enabled,
                     "criterion": args.early_stopping_metric,
                     "patience_steps": args.early_stopping_patience,
-                    "min_delta": args.early_stopping_min_delta,
+                    "min_delta": effective_early_stopping_min_delta,
+                    "requested_min_delta": requested_early_stopping_min_delta,
                     "mode": monitored_mode,
                     "monitored_metric": monitored_metric,
                     "best_value": selected_best_value,
                     "best_step": selected_best_step,
+                    "patience_reference_value": selected_patience_value,
+                    "patience_reference_step": selected_patience_step,
                     "steps_since_improvement": (
                         None
-                        if selected_best_step is None
-                        else step - selected_best_step
+                        if selected_patience_step is None
+                        else step - selected_patience_step
                     ),
+                    "restored_best_weights": restored_best_weights,
+                    "restored_best_step": restored_best_step,
+                    "best_snapshot_directory": "best" if early_stopping_enabled else None,
                     "best_validation_bpb": (
                         best_validation_bpb
                         if best_validation_step is not None
@@ -982,6 +1221,7 @@ def main() -> None:
                 optimizer.state_dict(),
                 {
                     "step": step,
+                    "checkpoint_weights_step": restored_best_step if restored_best_weights else step,
                     "model_config": model_config,
                     "user_config": user_config,
                     "device_batch_size": args.device_batch_size,

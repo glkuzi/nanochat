@@ -3,6 +3,7 @@
 import torch
 
 from nanochat.armt import ARMTGPT, ARMTGPTConfig
+from nanochat.babilong_eval import _ensure_rotary_capacity as _ensure_babilong_rotary_capacity
 from nanochat.gpt import GPT, GPTConfig
 
 
@@ -119,11 +120,61 @@ def test_loaded_context_length_can_shrink_or_grow_without_nan():
     targets = torch.randint(0, model.config.vocab_size, (2, 8))
     assert torch.isfinite(model(x, targets))
 
-    # The original cache has 160 positions. Absolute ARMT positions at this
-    # length need 201 positions, so this also exercises dynamic cache growth.
+    # Absolute ARMT positions at this length need 201 positions, well beyond
+    # the initial planned-context cache, so this exercises dynamic growth.
     model.set_sequence_len(133)
     assert model.config.sequence_len == 133
     assert model.cos.size(1) >= model._required_rotary_positions(133)
     x = torch.randint(0, model.config.vocab_size, (1, 17), dtype=torch.int32)
     targets = torch.randint(0, model.config.vocab_size, (1, 17))
     assert torch.isfinite(model(x, targets))
+
+
+def test_forward_dynamically_grows_beyond_checkpoint_context_and_rope_cache():
+    torch.manual_seed(2468)
+    model = _build_armt(sequence_len=4, segment_size=4, num_mem_tokens=2)
+    original_cache_size = model.cos.size(1)
+    sequence_len = 33
+    assert model._required_rotary_positions(sequence_len) > original_cache_size
+
+    x = torch.randint(0, model.config.vocab_size, (1, sequence_len))
+    targets = torch.randint(0, model.config.vocab_size, (1, sequence_len))
+    loss = model(x, targets)
+
+    assert torch.isfinite(loss)
+    assert model.config.sequence_len == 4
+    assert model.cos.size(1) >= model._required_rotary_positions(sequence_len)
+
+    padded_model = _build_armt(sequence_len=4, segment_size=4, num_mem_tokens=2)
+    padded_model.set_sequence_len(9)
+    train_x = torch.randint(0, padded_model.config.vocab_size, (1, 9))
+    train_targets = torch.randint(0, padded_model.config.vocab_size, (1, 9))
+    compiled_model = torch.compile(padded_model, backend="aot_eager", dynamic=False)
+    initial_loss = compiled_model(train_x, train_targets)
+    initial_loss.backward()
+    padded_model.zero_grad(set_to_none=True)
+
+    lengths = torch.tensor([sequence_len, 17])
+    padded_x = torch.randint(
+        0, padded_model.config.vocab_size, (2, sequence_len)
+    )
+    padded_model.eval()
+    with torch.inference_mode():
+        _ensure_babilong_rotary_capacity(padded_model, sequence_len)
+        logits = padded_model.forward_padded(padded_x, lengths)
+
+    assert torch.isfinite(logits).all()
+    assert not torch.is_inference(padded_model.cos)
+    assert not torch.is_inference(padded_model.sin)
+    assert padded_model.cos.size(1) >= padded_model._required_rotary_positions(
+        sequence_len
+    )
+
+    # Match babilong_train: resume through the already-compiled training graph
+    # and reuse the cache that BABILong enlarged during inference evaluation.
+    padded_model.train()
+    resumed_loss = compiled_model(train_x, train_targets)
+    resumed_loss.backward()
+
+    assert torch.isfinite(resumed_loss)
+    assert padded_model.transformer.h[0].attn.c_q.weight.grad is not None
