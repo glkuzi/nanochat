@@ -60,7 +60,7 @@ class GPTConfig(PretrainedConfig):
         self.num_key_value_heads = self.n_kv_head
         kwargs.setdefault("tie_word_embeddings", False)
         kwargs.setdefault("is_decoder", True)
-        kwargs.setdefault("use_cache", False)
+        self.use_cache = bool(kwargs.pop("use_cache", True))
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

@@ -771,7 +771,95 @@ class ARMTGPT(GPT):
             reduction=loss_reduction,
         )
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+    def _forward_packed_samples(
+        self,
+        idx: torch.Tensor,
+        sample_ids: torch.Tensor,
+        targets=None,
+        loss_reduction: str = "mean",
+    ):
+        """Process packed samples independently, including independent ARMT memory."""
+        if loss_reduction not in {"none", "mean", "sum"}:
+            raise ValueError(f"Unsupported loss reduction: {loss_reduction}")
+        if targets is not None and targets.shape != idx.shape:
+            raise ValueError(
+                f"targets must match idx shape {tuple(idx.shape)}, "
+                f"got {tuple(targets.shape)}"
+            )
+
+        batch_size, time = idx.shape
+        output = (
+            idx.new_zeros(
+                (batch_size, time, self.config.vocab_size), dtype=torch.float32
+            )
+            if targets is None
+            else idx.new_zeros((batch_size, time), dtype=torch.float32)
+        )
+        found_sample = False
+        for row in range(batch_size):
+            row_ids = sample_ids[row].detach().cpu().tolist()
+            start = 0
+            while start < time:
+                sample_id = row_ids[start]
+                end = start + 1
+                while end < time and row_ids[end] == sample_id:
+                    end += 1
+                if sample_id >= 0:
+                    found_sample = True
+                    sample_idx = idx[row : row + 1, start:end]
+                    if targets is None:
+                        sample_output = self._forward_full(sample_idx)
+                        output[row, start:end] = sample_output[0]
+                    else:
+                        sample_targets = targets[row : row + 1, start:end]
+                        sample_losses = self._forward_full(
+                            sample_idx,
+                            targets=sample_targets,
+                            loss_reduction="none",
+                        )
+                        output[row, start:end] = sample_losses.view(-1)
+                start = end
+        if not found_sample:
+            raise ValueError("packed attention_mask does not contain a real sample")
+        if targets is None:
+            return output
+        if loss_reduction == "none":
+            return output.reshape(-1)
+        total_loss = output.sum()
+        if loss_reduction == "sum":
+            return total_loss
+        return total_loss / (targets >= 0).sum()
+
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction="mean",
+        attention_mask=None,
+    ):
+        if attention_mask is not None:
+            if kv_cache is not None:
+                raise ValueError("packed attention_mask is not supported with kv_cache")
+            if attention_mask.shape != idx.shape:
+                raise ValueError(
+                    "packed attention_mask must match idx shape "
+                    f"{tuple(idx.shape)}, got {tuple(attention_mask.shape)}"
+                )
+            if attention_mask.dtype == torch.bool or torch.is_floating_point(
+                attention_mask
+            ):
+                raise TypeError("packed attention_mask must contain integer sample IDs")
+            if attention_mask.device != idx.device:
+                raise ValueError(
+                    "packed attention_mask and idx must be on the same device"
+                )
+            return self._forward_packed_samples(
+                idx,
+                attention_mask,
+                targets=targets,
+                loss_reduction=loss_reduction,
+            )
         if kv_cache is None:
             return self._forward_full(idx, targets=targets, loss_reduction=loss_reduction)
         if targets is not None:

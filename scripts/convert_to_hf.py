@@ -130,7 +130,7 @@ model = AutoModelForCausalLM.from_pretrained(
     "OWNER/REPOSITORY",
     trust_remote_code=True,
 )
-output = model.generate(input_ids, max_new_tokens=32, use_cache=False)
+output = model.generate(input_ids, max_new_tokens=32, use_cache=True)
 ```
 
 Review remote model code before enabling `trust_remote_code` for repositories

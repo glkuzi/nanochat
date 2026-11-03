@@ -23,6 +23,16 @@ def _native_model(model_cls, config):
     return model.eval()
 
 
+def _activate_armt_memory(model):
+    # Native initialization makes ARMT insertion neutral. Simulate a trained
+    # checkpoint so recurrence parity exercises actual associative reads/writes.
+    with torch.no_grad():
+        for wrapped, controller in zip(model.wrap_layers, model.armt_layers):
+            if wrapped:
+                controller.W_mv.weight.normal_(mean=0.0, std=0.02)
+    return model
+
+
 @pytest.mark.parametrize("architecture", ["gpt", "armtgpt"])
 def test_native_parity_and_remote_code_roundtrip(tmp_path, architecture):
     common = dict(
@@ -47,7 +57,7 @@ def test_native_parity_and_remote_code_roundtrip(tmp_path, architecture):
             use_sink=True,
             memory_dtype="float32",
         )
-        native = _native_model(NativeARMTGPT, native_config)
+        native = _activate_armt_memory(_native_model(NativeARMTGPT, native_config))
 
     state_dict = native.state_dict()
     model, detected = build_hf_model(state_dict, {"model_config": asdict(native_config)})
@@ -71,9 +81,9 @@ def test_native_parity_and_remote_code_roundtrip(tmp_path, architecture):
     with torch.inference_mode():
         torch.testing.assert_close(reloaded(input_ids).logits, actual)
     generated = reloaded.generate(
-        input_ids[:1, :3], max_new_tokens=2, do_sample=False, use_cache=False
+        input_ids[:1], max_new_tokens=3, do_sample=False, use_cache=True
     )
-    assert generated.shape == (1, 5)
+    assert generated.shape == (1, 10)
 
 
 def test_armt_right_padded_batch_matches_independent_rows():
@@ -92,7 +102,7 @@ def test_armt_right_padded_batch_matches_independent_rows():
         use_sink=True,
         memory_dtype="float32",
     )
-    native = _native_model(NativeARMTGPT, config)
+    native = _activate_armt_memory(_native_model(NativeARMTGPT, config))
     model, _ = build_hf_model(native.state_dict(), {"model_config": asdict(config)})
     input_ids = torch.randint(0, config.vocab_size, (2, 7))
     attention_mask = torch.tensor(
@@ -118,3 +128,91 @@ def test_armt_right_padded_batch_matches_independent_rows():
         pad_token_id=0,
     )
     assert generated.shape == (1, 9)
+
+
+@pytest.mark.parametrize("architecture", ["gpt", "armtgpt"])
+@pytest.mark.parametrize("num_beams", [1, 2])
+def test_cached_generation_matches_uncached_scores_and_tokens(architecture, num_beams):
+    common = dict(
+        sequence_len=32,
+        vocab_size=128,
+        n_layer=2,
+        n_head=4,
+        n_kv_head=2,
+        n_embd=32,
+        window_pattern="L",
+    )
+    if architecture == "gpt":
+        native_config = NativeGPTConfig(**common)
+        native = _native_model(NativeGPT, native_config)
+    else:
+        native_config = NativeARMTGPTConfig(
+            **common,
+            num_mem_tokens=2,
+            d_mem=8,
+            segment_size=4,
+            n_heads=2,
+            use_sink=True,
+            memory_dtype="float32",
+        )
+        native = _activate_armt_memory(_native_model(NativeARMTGPT, native_config))
+
+    model, _ = build_hf_model(native.state_dict(), {"model_config": asdict(native_config)})
+    input_ids = torch.randint(0, native_config.vocab_size, (1, 10))
+    generation_kwargs = dict(
+        max_new_tokens=6,
+        do_sample=False,
+        return_dict_in_generate=True,
+        output_scores=True,
+        num_beams=num_beams,
+    )
+    with torch.inference_mode():
+        uncached = model.generate(input_ids, use_cache=False, **generation_kwargs)
+        cached = model.generate(input_ids, use_cache=True, **generation_kwargs)
+
+    torch.testing.assert_close(cached.sequences, uncached.sequences)
+    assert len(cached.scores) == len(uncached.scores)
+    for cached_score, uncached_score in zip(cached.scores, uncached.scores):
+        torch.testing.assert_close(cached_score, uncached_score, atol=3e-5, rtol=3e-5)
+
+
+def test_armt_cache_avoids_reprocessing_completed_segments():
+    config = NativeARMTGPTConfig(
+        sequence_len=32,
+        vocab_size=128,
+        n_layer=2,
+        n_head=4,
+        n_kv_head=2,
+        n_embd=32,
+        window_pattern="L",
+        num_mem_tokens=2,
+        d_mem=8,
+        segment_size=4,
+        n_heads=2,
+        use_sink=True,
+        memory_dtype="float32",
+    )
+    native = _activate_armt_memory(_native_model(NativeARMTGPT, config))
+    model, _ = build_hf_model(native.state_dict(), {"model_config": asdict(config)})
+    input_ids = torch.randint(0, config.vocab_size, (1, 10))
+    calls = 0
+
+    def count_block_calls(module, args, output):
+        del module, args, output
+        nonlocal calls
+        calls += 1
+
+    handles = [block.register_forward_hook(count_block_calls) for block in model.transformer["h"]]
+    try:
+        with torch.inference_mode():
+            model.generate(input_ids, max_new_tokens=4, do_sample=False, use_cache=False)
+        uncached_calls = calls
+        calls = 0
+        with torch.inference_mode():
+            model.generate(input_ids, max_new_tokens=4, do_sample=False, use_cache=True)
+        cached_calls = calls
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert cached_calls < uncached_calls

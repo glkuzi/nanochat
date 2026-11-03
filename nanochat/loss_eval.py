@@ -29,8 +29,18 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        batch = next(batch_iter)
+        if len(batch) == 2:
+            x, y = batch
+            model_kwargs = {}
+        elif len(batch) == 3:
+            x, y, attention_mask = batch
+            model_kwargs = {"attention_mask": attention_mask}
+        else:
+            raise ValueError("evaluation batches must contain 2 or 3 tensors")
+        loss2d = model(
+            x, y, loss_reduction="none", **model_kwargs
+        )  # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

@@ -25,7 +25,7 @@ import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
 from nanochat.armt import ARMTGPT
-from nanochat.sft_data import render_sft_conversation
+from nanochat.sft_data import build_packed_sample_ids, render_sft_conversation
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
@@ -100,6 +100,16 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
 parser.add_argument("--use-full-smoltalk", action="store_true")
+parser.add_argument(
+    "--isolate-packed-samples",
+    "--use-packed-attention-mask",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "prevent attention and token-smear leakage between conversations packed "
+        "into the same row (also resets ARMT recurrence per conversation)"
+    ),
+)
 
 args = parser.parse_args()
 user_config = vars(args).copy()
@@ -126,6 +136,8 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 # Flash Attention status
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+if args.isolate_packed_samples:
+    print0("Packed-sample attention isolation enabled")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model(args.model_train_type, device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -181,7 +193,14 @@ if args.max_seq_len <= 1:
 orig_model = model
 orig_model.set_sequence_len(args.max_seq_len)
 checkpoint_model_config = asdict(orig_model.config)
-model = torch.compile(model, dynamic=False)
+if args.isolate_packed_samples and isinstance(orig_model, ARMTGPT):
+    # ARMT must restart its recurrent state at data-dependent conversation
+    # boundaries. Keep this opt-in path eager instead of recompiling for every
+    # packing layout.
+    print0("Packed-sample isolation enabled for ARMT; using eager execution")
+    model = orig_model
+else:
+    model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -306,10 +325,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     while True:
         rows = []
         mask_rows = []
+        sample_id_rows = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
         for _ in range(args.device_batch_size):
             row = []
             mask_row = []
+            conversation_lengths = []
             padded = False
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
@@ -332,6 +353,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     conv, conv_mask = conv_buffer.pop(best_idx)
                     row.extend(conv)
                     mask_row.extend(conv_mask)
+                    conversation_lengths.append(len(conv))
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits: pad rather than split it across rows.
@@ -341,13 +363,17 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     padded = True
                     break  # Row is now full (with padding)
 
-            # Track content length: full row if no padding, otherwise the length before padding
+            # Track content length: full row if no padding, otherwise content.
             if padded:
                 row_lengths.append(content_len)
             else:
                 row_lengths.append(row_capacity)
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
+            if args.isolate_packed_samples:
+                sample_id_rows.append(
+                    build_packed_sample_ids(conversation_lengths, row_capacity)
+                )
 
         if not any(any(mask_row[1:]) for mask_row in mask_rows):
             raise RuntimeError(
@@ -390,10 +416,29 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
-        yield inputs, targets
+        if args.isolate_packed_samples:
+            sample_id_tensor = torch.tensor(
+                sample_id_rows, dtype=torch.int32, pin_memory=use_cuda
+            )
+            attention_mask = sample_id_tensor[:, :-1].to(
+                device=device,
+                non_blocking=use_cuda,
+            ).contiguous()
+            yield inputs, targets, attention_mask
+        else:
+            yield inputs, targets
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
+
+def next_sft_batch(loader):
+    batch = next(loader)
+    if len(batch) == 2:
+        inputs, targets = batch
+        return inputs, targets, None
+    inputs, targets, attention_mask = batch
+    return inputs, targets, attention_mask
+
 progress = 0 # will go from 0 to 1 over the course of the epoch
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
@@ -416,7 +461,7 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+x, y, attention_mask = next_sft_batch(train_loader) # prefetch first batch
 debug = False
 if debug:
     print(x)
@@ -530,14 +575,14 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, attention_mask=attention_mask)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, attention_mask = next_sft_batch(train_loader) # prefetch next batch
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)

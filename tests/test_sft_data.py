@@ -1,4 +1,4 @@
-from nanochat.sft_data import render_sft_conversation
+from nanochat.sft_data import build_packed_sample_ids, render_sft_conversation
 
 
 class FakeTokenizer:
@@ -25,3 +25,9 @@ def test_render_sft_conversation_skips_truncation_without_targets():
     tokenizer = FakeTokenizer(list(range(20)), [0] * 10 + [1] * 10)
 
     assert render_sft_conversation(tokenizer, {}, row_capacity=8) is None
+
+
+def test_build_packed_sample_ids_isolates_conversations_and_padding():
+    sample_ids = build_packed_sample_ids([3, 2, 4], row_capacity=12)
+
+    assert sample_ids == [0, 0, 0, 1, 1, 2, 2, 2, 2, -1, -1, -1]

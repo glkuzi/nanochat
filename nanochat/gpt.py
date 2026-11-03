@@ -64,6 +64,23 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+
+def _packed_causal_attention_mask(sample_ids, window_size):
+    """Expand compact packed-sample IDs into an SDPA boolean attention mask."""
+    if sample_ids.ndim != 2:
+        raise ValueError("packed attention_mask must have shape (batch, time)")
+    time = sample_ids.size(1)
+    positions = torch.arange(time, device=sample_ids.device)
+    query_positions = positions.view(1, time, 1)
+    key_positions = positions.view(1, 1, time)
+    mask = sample_ids[:, :, None] == sample_ids[:, None, :]
+    mask &= query_positions >= key_positions
+    window = window_size[0]
+    if window >= 0:
+        mask &= query_positions - key_positions <= window
+    return mask[:, None, :, :]
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -110,9 +127,9 @@ class CausalSelfAttention(nn.Module):
                 # Training: causal attention with optional sliding window
                 y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
             else:
-                # Ragged ARMT batches require an explicit per-row padding mask.
-                # Flash Attention's dense API has no padding-mask argument, so
-                # use SDPA for this inference-only path.
+                # Packed SFT and ragged ARMT batches need explicit masks.
+                # Flash Attention dense kernels cannot express these layouts,
+                # so masked calls use PyTorch SDPA.
                 q_sdpa = q.transpose(1, 2)
                 k_sdpa = k.transpose(1, 2)
                 v_sdpa = v.transpose(1, 2)
@@ -507,8 +524,31 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        loss_reduction="mean",
+        attention_mask=None,
+    ):
         B, T = idx.size()
+        if attention_mask is not None:
+            if kv_cache is not None:
+                raise ValueError("packed attention_mask is not supported with kv_cache")
+            if attention_mask.shape != idx.shape:
+                raise ValueError(
+                    "packed attention_mask must match idx shape "
+                    f"{tuple(idx.shape)}, got {tuple(attention_mask.shape)}"
+                )
+            if attention_mask.dtype == torch.bool or torch.is_floating_point(
+                attention_mask
+            ):
+                raise TypeError("packed attention_mask must contain integer sample IDs")
+            if attention_mask.device != idx.device:
+                raise ValueError(
+                    "packed attention_mask and idx must be on the same device"
+                )
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         max_rotary_position = T
@@ -547,7 +587,11 @@ class GPT(nn.Module):
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            previous_x = x[:, :-1]
+            if attention_mask is not None:
+                same_sample = attention_mask[:, 1:] == attention_mask[:, :-1]
+                previous_x = previous_x * same_sample.unsqueeze(-1)
+            x = torch.cat([x[:, :1], x[:, 1:] + gate * previous_x], dim=1)
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
@@ -569,7 +613,21 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            layer_attention_mask = (
+                None
+                if attention_mask is None
+                else _packed_causal_attention_mask(
+                    attention_mask, self.window_sizes[i]
+                )
+            )
+            x = block(
+                x,
+                ve,
+                cos_sin,
+                self.window_sizes[i],
+                kv_cache,
+                attention_mask=layer_attention_mask,
+            )
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

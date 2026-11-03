@@ -66,18 +66,24 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
 def _causal_attention_mask(
     attention_mask: Optional[torch.Tensor],
     batch_size: int,
-    seq_len: int,
+    query_len: int,
+    key_len: int,
     window: int,
     device: torch.device,
 ) -> torch.Tensor:
-    positions = torch.arange(seq_len, device=device)
-    mask = positions.view(-1, 1) >= positions.view(1, -1)
+    key_positions = torch.arange(key_len, device=device)
+    query_positions = torch.arange(key_len - query_len, key_len, device=device)
+    mask = query_positions.view(-1, 1) >= key_positions.view(1, -1)
     if window >= 0:
-        mask &= (positions.view(-1, 1) - positions.view(1, -1)) <= window
-    mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, -1, -1, -1)
+        mask &= (query_positions.view(-1, 1) - key_positions.view(1, -1)) <= window
+    mask = mask.view(1, 1, query_len, key_len).expand(batch_size, -1, -1, -1)
     if attention_mask is not None:
         valid = attention_mask.to(device=device, dtype=torch.bool)
-        mask = mask & valid[:, None, :, None] & valid[:, None, None, :]
+        if valid.shape != (batch_size, key_len):
+            raise ValueError(
+                f"attention_mask must have shape {(batch_size, key_len)}, got {tuple(valid.shape)}"
+            )
+        mask = mask & valid[:, None, -query_len:, None] & valid[:, None, None, :]
     return mask
 
 
@@ -107,7 +113,9 @@ class CausalSelfAttention(nn.Module):
         cos_sin: tuple[torch.Tensor, torch.Tensor],
         window_size: tuple[int, int],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_key_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
         batch_size, seq_len, _ = x.shape
         q = self.c_q(x).view(batch_size, seq_len, self.n_head, self.head_dim)
         k = self.c_k(x).view(batch_size, seq_len, self.n_kv_head, self.head_dim)
@@ -123,6 +131,11 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+        present = (k, v) if use_cache else None
         if self.n_head != self.n_kv_head:
             repeats = self.n_head // self.n_kv_head
             k = k.repeat_interleave(repeats, dim=1)
@@ -131,11 +144,17 @@ class CausalSelfAttention(nn.Module):
             mask = attention_mask.to(device=x.device, dtype=torch.bool)
         else:
             mask = _causal_attention_mask(
-                attention_mask, batch_size, seq_len, window_size[0], x.device
+                attention_mask,
+                batch_size,
+                seq_len,
+                k.size(2),
+                window_size[0],
+                x.device,
             )
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_embd)
-        return self.c_proj(y)
+        output = self.c_proj(y)
+        return (output, present) if use_cache else output
 
 
 class MLP(nn.Module):
@@ -161,9 +180,23 @@ class Block(nn.Module):
         cos_sin: tuple[torch.Tensor, torch.Tensor],
         window_size: tuple[int, int],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, attention_mask)
-        return x + self.mlp(norm(x))
+        past_key_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ):
+        attention_output = self.attn(
+            norm(x),
+            ve,
+            cos_sin,
+            window_size,
+            attention_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+        if use_cache:
+            attention_output, present = attention_output
+        x = x + attention_output
+        x = x + self.mlp(norm(x))
+        return (x, present) if use_cache else x
 
 
 class NanoChatPreTrainedModel(PreTrainedModel):
@@ -171,6 +204,12 @@ class NanoChatPreTrainedModel(PreTrainedModel):
     main_input_name = "input_ids"
     _supports_cache_class = False
     _supports_static_cache = False
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        # Transformers 5 uses this method instead of _supports_cache_class.
+        # These models supply either a legacy GPT tuple or an ARMT segment cache.
+        return False
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Embedding):
@@ -192,10 +231,13 @@ class NanoChatPreTrainedModel(PreTrainedModel):
     def set_output_embeddings(self, value):
         self.lm_head = value
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
-        # No KV cache is used: recomputing the full prefix is slower but exactly
-        # preserves smear, sliding-window, and ARMT recurrence semantics.
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False}
+    def _reorder_cache(self, past_key_values, beam_idx):
+        if hasattr(past_key_values, "reorder"):
+            return past_key_values.reorder(beam_idx)
+        return tuple(
+            tuple(state.index_select(0, beam_idx.to(state.device)) for state in layer)
+            for layer in past_key_values
+        )
 
     @staticmethod
     def _causal_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -216,18 +258,21 @@ class NanoChatPreTrainedModel(PreTrainedModel):
         hidden_states: Optional[torch.Tensor],
         return_dict: bool,
         output_hidden_states: bool,
+        past_key_values=None,
     ):
         loss = None if labels is None else self._causal_lm_loss(logits, labels)
         all_hidden = (hidden_states,) if output_hidden_states and hidden_states is not None else None
         if not return_dict:
             values = (logits,)
+            if past_key_values is not None:
+                values += (past_key_values,)
             if all_hidden is not None:
                 values += (all_hidden,)
             return ((loss,) + values) if loss is not None else values
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=None,
+            past_key_values=past_key_values,
             hidden_states=all_hidden,
             attentions=None,
         )
@@ -288,57 +333,118 @@ class GPT(NanoChatPreTrainedModel, GenerationMixin):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+        past_key_values=None,
+        use_cache: bool = False,
+        smear_prev_input_ids: Optional[torch.Tensor] = None,
+    ):
         if input_ids.ndim != 2:
             raise ValueError(f"input_ids must have shape (batch, time), got {tuple(input_ids.shape)}")
         batch_size, seq_len = input_ids.shape
         if seq_len == 0:
             raise ValueError("nanochat GPT cannot process an empty sequence")
-        if attention_mask is not None and attention_mask.shape != input_ids.shape:
-            raise ValueError("attention_mask must have the same shape as input_ids")
+        past_length = 0
+        if past_key_values is not None:
+            if len(past_key_values) != self.config.n_layer:
+                raise ValueError("past_key_values must contain one entry per layer")
+            past_length = past_key_values[0][0].size(2)
+        key_len = past_length + seq_len
+        if attention_mask is not None and attention_mask.shape != (batch_size, key_len):
+            raise ValueError(
+                f"attention_mask must have shape {(batch_size, key_len)}, "
+                f"got {tuple(attention_mask.shape)}"
+            )
         if position_ids is None:
             if attention_mask is None:
-                position_ids = torch.arange(seq_len, device=input_ids.device).view(1, -1)
-                position_ids = position_ids.expand(batch_size, -1)
+                position_ids = torch.arange(
+                    past_length, key_len, device=input_ids.device
+                ).view(1, -1).expand(batch_size, -1)
             else:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids = position_ids.clamp_min(0)
+                position_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+                position_ids = position_ids[:, -seq_len:]
         if position_ids.shape != input_ids.shape:
             raise ValueError("position_ids must have the same shape as input_ids")
-        if int(position_ids.max().item()) >= self.config.sequence_len * 10:
-            raise ValueError("position_ids exceed nanochat's 10x rotary-position budget")
 
         x = norm(self.transformer["wte"](input_ids))
-        valid = None if attention_mask is None else attention_mask.to(x.dtype).unsqueeze(-1)
+        valid = None
+        if attention_mask is not None:
+            valid = attention_mask[:, -seq_len:].to(x.dtype).unsqueeze(-1)
+            x = x * valid
+        if smear_prev_input_ids is not None:
+            previous = norm(self.transformer["wte"](smear_prev_input_ids))
+            shifted = torch.cat((previous, x[:, :-1]), dim=1)
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[..., :24]))
+            x = x + gate * shifted
+        elif seq_len > 1:
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+            x = torch.cat((x[:, :1], x[:, 1:] + gate * x[:, :-1]), dim=1)
         if valid is not None:
             x = x * valid
-        if seq_len > 1:
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            smeared = x[:, 1:] + gate * x[:, :-1]
-            x = torch.cat((x[:, :1], smeared), dim=1)
-            if valid is not None:
-                x = x * valid
         cos_sin = self._cos_sin(position_ids, x.dtype)
 
         x0 = x
         x_backout = None
+        presents = [] if use_cache else None
         for i, block in enumerate(self.transformer["h"]):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](input_ids).to(x.dtype) if str(i) in self.value_embeds else None
             if ve is not None and valid is not None:
                 ve = ve * valid
-            x = block(x, ve, cos_sin, self.window_sizes[i], attention_mask)
+            layer_past = None if past_key_values is None else past_key_values[i]
+            block_output = block(
+                x,
+                ve,
+                cos_sin,
+                self.window_sizes[i],
+                attention_mask,
+                past_key_value=layer_past,
+                use_cache=use_cache,
+            )
+            if use_cache:
+                x, present = block_output
+                presents.append(present)
+            else:
+                x = block_output
             if valid is not None:
                 x = x * valid
             if i == self.config.n_layer // 2:
                 x_backout = x
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        return norm(x)
+        return norm(x), (tuple(presents) if use_cache else None)
 
     def _logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden_states)[..., : self.config.vocab_size].float()
         return 15 * torch.tanh(logits / 15)
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=None,
+        **kwargs,
+    ):
+        use_cache = self.config.use_cache if use_cache is None else use_cache
+        position_ids = None
+        smear_prev_input_ids = None
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].size(2)
+            start = past_length if input_ids.size(1) > past_length else input_ids.size(1) - 1
+            start = max(start, 0)
+            if start:
+                smear_prev_input_ids = input_ids[:, start - 1 : start]
+            input_ids = input_ids[:, start:]
+            if attention_mask is not None:
+                position_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+                position_ids = position_ids[:, -input_ids.size(1) :]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "smear_prev_input_ids": smear_prev_input_ids,
+        }
 
     def forward(
         self,
@@ -352,9 +458,10 @@ class GPT(NanoChatPreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        smear_prev_input_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        del past_key_values, use_cache, kwargs
+        del kwargs
         if inputs_embeds is not None:
             raise ValueError("nanochat value embeddings require input_ids; inputs_embeds is unsupported")
         if input_ids is None:
@@ -363,9 +470,26 @@ class GPT(NanoChatPreTrainedModel, GenerationMixin):
             raise NotImplementedError("output_attentions is not implemented")
         output_hidden_states = bool(output_hidden_states)
         return_dict = self.config.return_dict if return_dict is None else return_dict
-        hidden = self._forward_hidden(input_ids, attention_mask, position_ids)
+        use_cache = self.config.use_cache if use_cache is None else use_cache
+        if labels is not None and past_key_values is not None:
+            raise ValueError("labels cannot be used with past_key_values")
+        if labels is not None:
+            use_cache = False
+        hidden, present = self._forward_hidden(
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            smear_prev_input_ids=smear_prev_input_ids,
+        )
         return self._format_output(
-            self._logits(hidden), labels, hidden, return_dict, output_hidden_states
+            self._logits(hidden),
+            labels,
+            hidden,
+            return_dict,
+            output_hidden_states,
+            past_key_values=present,
         )
 
 
@@ -468,6 +592,27 @@ class AssociativeMemoryController(nn.Module):
             denominator = denominator + (new_info_coef * mk).sum(dim=-2)
         return memory, denominator
 
+    def forward_segment(
+        self,
+        block,
+        x,
+        ve,
+        cos_sin,
+        window_size,
+        state=None,
+    ):
+        """Process one augmented segment and return its associative-memory state."""
+        first_segment = state is None
+        if first_segment:
+            memory, denominator = self._initial_memory(x.size(0), x.device)
+        else:
+            memory, denominator = state
+            x = x + self._associate(x, memory, denominator)
+        output = block(x, ve, cos_sin, window_size)
+        mem_out = output[:, -self.num_mem_tokens :, :]
+        state = self._update(mem_out, memory, denominator, first_segment=first_segment)
+        return output, state
+
     def forward(self, block, x, ve, cos_sin, window_size):
         extra_tokens = self.num_mem_tokens + int(self.use_sink)
         chunk_size = self.segment_size + extra_tokens
@@ -480,12 +625,9 @@ class AssociativeMemoryController(nn.Module):
         for segment_index, (x_seg, ve_seg, cos_seg, sin_seg) in enumerate(
             zip(x_chunks, ve_chunks, cos_chunks, sin_chunks)
         ):
-            if segment_index:
-                x_seg = x_seg + self._associate(x_seg, memory, denominator)
-            seg_out = block(x_seg, ve_seg, (cos_seg, sin_seg), window_size)
-            mem_out = seg_out[:, -self.num_mem_tokens :, :]
-            memory, denominator = self._update(
-                mem_out, memory, denominator, first_segment=segment_index == 0
+            state = None if segment_index == 0 else (memory, denominator)
+            seg_out, (memory, denominator) = self.forward_segment(
+                block, x_seg, ve_seg, (cos_seg, sin_seg), window_size, state
             )
             outputs.append(seg_out)
         return torch.cat(outputs, dim=1)
@@ -530,6 +672,65 @@ class AssociativeMemoryController(nn.Module):
                 denominator = torch.where(active[:, None, None], new_denominator, denominator)
             outputs.append(seg_out)
         return torch.cat(outputs, dim=1)
+
+
+class ARMTGenerationCache:
+    """Generation state for segment-recurrent ARMT decoding.
+
+    Completed segments are represented only by their per-layer associative
+    memories.  The current segment is deliberately recomputed on each decode
+    step, matching the original ARMT generation algorithm without repeatedly
+    running the entire prefix.
+    """
+
+    def __init__(
+        self,
+        committed_states,
+        active_states,
+        active_start: int,
+        active_length: int,
+        processed_length: int,
+    ) -> None:
+        self.committed_states = committed_states
+        self.active_states = active_states
+        self.active_start = int(active_start)
+        self.active_length = int(active_length)
+        self.processed_length = int(processed_length)
+
+    @staticmethod
+    def _reorder_states(states, beam_idx):
+        if states is None:
+            return None
+        reordered = []
+        for state in states:
+            if state is None:
+                reordered.append(None)
+                continue
+            memory, denominator = state
+            index = beam_idx.to(memory.device)
+            memory = memory.index_select(0, index)
+            if denominator is not None:
+                denominator = denominator.index_select(0, index)
+            reordered.append((memory, denominator))
+        return tuple(reordered)
+
+    def reorder(self, beam_idx):
+        return type(self)(
+            self._reorder_states(self.committed_states, beam_idx),
+            self._reorder_states(self.active_states, beam_idx),
+            self.active_start,
+            self.active_length,
+            self.processed_length,
+        )
+
+    def reorder_cache(self, beam_idx) -> None:
+        """Transformers Cache-compatible in-place beam reordering."""
+        self.committed_states = self._reorder_states(self.committed_states, beam_idx)
+        self.active_states = self._reorder_states(self.active_states, beam_idx)
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        del layer_idx
+        return self.processed_length
 
 
 class ARMTGPT(GPT, GenerationMixin):
@@ -607,8 +808,8 @@ class ARMTGPT(GPT, GenerationMixin):
             positions.append(torch.arange(start, start + length, device=device))
             absolute_start += length
         position_ids = torch.cat(positions).long().unsqueeze(0)
-        if int(position_ids.max().item()) >= self.config.sequence_len * 10:
-            raise ValueError("ARMT augmented positions exceed nanochat's 10x rotary-position budget")
+        #if int(position_ids.max().item()) >= self.config.sequence_len * 10:
+        #    raise ValueError("ARMT augmented positions exceed nanochat's 10x rotary-position budget")
         return self._cos_sin(position_ids, dtype)
 
     def _forward_full(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -716,6 +917,112 @@ class ARMTGPT(GPT, GenerationMixin):
                     ]
         return output
 
+    def _segment_cos_sin(self, segment_index: int, length: int, device, dtype):
+        extra = self.config.num_mem_tokens + int(self.config.use_sink)
+        start = 0
+        if self.config.segment_position_mode == "absolute":
+            start = segment_index * (self.config.segment_size + extra)
+        position_ids = torch.arange(start, start + length + extra, device=device).view(1, -1)
+        return self._cos_sin(position_ids, dtype)
+
+    def _forward_segment_cached(
+        self,
+        input_ids: torch.Tensor,
+        segment_index: int,
+        states,
+        previous_input_ids: Optional[torch.Tensor] = None,
+    ):
+        """Run one real-token segment through every base and ARMT layer."""
+        x = norm(self.transformer["wte"](input_ids))
+        if previous_input_ids is not None:
+            previous = norm(self.transformer["wte"](previous_input_ids))
+            shifted = torch.cat((previous, x[:, :-1]), dim=1)
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[..., :24]))
+            x = x + gate * shifted
+        elif input_ids.size(1) > 1:
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+            x = torch.cat((x[:, :1], x[:, 1:] + gate * x[:, :-1]), dim=1)
+
+        x = self._augment_hidden(x)
+        cos_sin = self._segment_cos_sin(
+            segment_index, input_ids.size(1), input_ids.device, x.dtype
+        )
+        x0 = x
+        x_backout = None
+        next_states = []
+        for i, block in enumerate(self.transformer["h"]):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = None
+            if str(i) in self.value_embeds:
+                values = self.value_embeds[str(i)](input_ids).to(x.dtype)
+                ve = self._augment_values(values)
+            x, state = self.armt_layers[i].forward_segment(
+                block,
+                x,
+                ve,
+                cos_sin,
+                self.window_sizes[i],
+                None if states is None else states[i],
+            )
+            next_states.append(state)
+            if i == self.config.n_layer // 2:
+                x_backout = x
+        if x_backout is not None:
+            x = x - self.backout_lambda.to(x.dtype) * x_backout
+        return self._clean_sequence(norm(x)), tuple(next_states)
+
+    def _forward_cached(self, input_ids: torch.Tensor, past_key_values=None):
+        """Decode by retaining completed segment memories, as modeling_amt does."""
+        seq_len = input_ids.size(1)
+        if seq_len == 0:
+            raise ValueError("ARMTGPT cannot process an empty sequence")
+        segment_size = self.config.segment_size
+
+        if past_key_values is None:
+            committed_states = None
+            active_start = 0
+        else:
+            if not isinstance(past_key_values, ARMTGenerationCache):
+                raise TypeError("ARMTGPT expects an ARMTGenerationCache")
+            if seq_len < past_key_values.processed_length:
+                raise ValueError(
+                    "Cached ARMT decoding requires the full input prefix on every call"
+                )
+            committed_states = past_key_values.committed_states
+            active_start = past_key_values.active_start
+            if (
+                past_key_values.active_length == segment_size
+                and seq_len > past_key_values.processed_length
+            ):
+                committed_states = past_key_values.active_states
+                active_start += segment_size
+
+        outputs = []
+        cursor = active_start
+        while seq_len - cursor > segment_size:
+            segment_ids = input_ids[:, cursor : cursor + segment_size]
+            previous = input_ids[:, cursor - 1 : cursor] if cursor else None
+            hidden, committed_states = self._forward_segment_cached(
+                segment_ids, cursor // segment_size, committed_states, previous
+            )
+            outputs.append(hidden)
+            cursor += segment_size
+
+        active_ids = input_ids[:, cursor:]
+        previous = input_ids[:, cursor - 1 : cursor] if cursor else None
+        hidden, active_states = self._forward_segment_cached(
+            active_ids, cursor // segment_size, committed_states, previous
+        )
+        outputs.append(hidden)
+        cache = ARMTGenerationCache(
+            committed_states=committed_states,
+            active_states=active_states,
+            active_start=cursor,
+            active_length=active_ids.size(1),
+            processed_length=seq_len,
+        )
+        return torch.cat(outputs, dim=1), cache
+
     def _forward_padded(self, input_ids: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         segment_lengths, valid_mask, position_ids = self._padded_layout(lengths)
         x = norm(self.transformer["wte"](input_ids))
@@ -754,6 +1061,24 @@ class ARMTGPT(GPT, GenerationMixin):
             output[row, mask[row]] = row_hidden[0]
         return output
 
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=None,
+        **kwargs,
+    ):
+        # The current segment must be recomputed from its beginning.  Keep the
+        # full token prefix while completed segments live in ARMTGenerationCache.
+        del kwargs
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "use_cache": self.config.use_cache if use_cache is None else use_cache,
+        }
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -768,37 +1093,61 @@ class ARMTGPT(GPT, GenerationMixin):
         return_dict: Optional[bool] = None,
         **kwargs,
     ):
-        del position_ids, past_key_values, use_cache, kwargs
+        del position_ids, kwargs
         if inputs_embeds is not None or input_ids is None:
             raise ValueError("ARMTGPT requires input_ids and does not support inputs_embeds")
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape (batch, time)")
         if output_attentions:
             raise NotImplementedError("output_attentions is not implemented")
-        if attention_mask is None:
-            hidden = self._forward_full(input_ids)
-        else:
+        use_cache = self.config.use_cache if use_cache is None else use_cache
+        if labels is not None and past_key_values is not None:
+            raise ValueError("labels cannot be used with past_key_values")
+        if labels is not None:
+            use_cache = False
+
+        mask = None
+        if attention_mask is not None:
             if attention_mask.shape != input_ids.shape:
                 raise ValueError("attention_mask must have the same shape as input_ids")
             mask = attention_mask.to(dtype=torch.bool, device=input_ids.device)
             lengths = mask.sum(-1)
             if bool(torch.any(lengths == 0)):
                 raise ValueError("Every ARMTGPT batch row must contain at least one valid token")
-            right_padded = (
-                torch.arange(input_ids.size(1), device=input_ids.device)[None, :]
-                < lengths[:, None]
-            )
-            if bool(torch.all(lengths == input_ids.size(1))):
+
+        can_cache = use_cache and labels is None and all(self.wrap_layers)
+        if mask is not None:
+            can_cache = can_cache and bool(torch.all(mask))
+        present = None
+        if can_cache:
+            hidden, present = self._forward_cached(input_ids, past_key_values)
+        else:
+            if past_key_values is not None:
+                raise ValueError(
+                    "ARMT generation cache supports only fully valid batches with every layer wrapped"
+                )
+            if mask is None or bool(torch.all(mask)):
                 hidden = self._forward_full(input_ids)
-            elif torch.equal(mask, right_padded):
-                hidden = self._forward_padded(input_ids, lengths)
             else:
-                hidden = self._forward_masked(input_ids, mask)
+                right_padded = (
+                    torch.arange(input_ids.size(1), device=input_ids.device)[None, :]
+                    < lengths[:, None]
+                )
+                if torch.equal(mask, right_padded):
+                    hidden = self._forward_padded(input_ids, lengths)
+                else:
+                    hidden = self._forward_masked(input_ids, mask)
         output_hidden_states = bool(output_hidden_states)
         return_dict = self.config.return_dict if return_dict is None else return_dict
         return self._format_output(
-            self._logits(hidden), labels, hidden, return_dict, output_hidden_states
+            self._logits(hidden),
+            labels,
+            hidden,
+            return_dict,
+            output_hidden_states,
+            past_key_values=present,
         )
+
 
 
 __all__ = [
@@ -807,4 +1156,5 @@ __all__ = [
     "GPT",
     "ARMTGPT",
     "AssociativeMemoryController",
+    "ARMTGenerationCache",
 ]
