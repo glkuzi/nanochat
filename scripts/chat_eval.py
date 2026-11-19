@@ -6,6 +6,7 @@ code lives in nanochat directory and is imported from here.
 Example runs:
 python -m scripts.chat_eval -i sft -a ARC-Easy --eval chat
 python -m scripts.chat_eval -i sft --eval babilong --babilong-tasks qa1-qa5
+python -m scripts.chat_eval -i sft --eval longbench-v2 --longbench-v2-max-length 32k
 torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy --eval chat
 """
 
@@ -28,6 +29,14 @@ from nanochat.babilong_eval import (
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import get_base_dir
 from nanochat.engine import Engine
+from nanochat.longbench_v2_eval import (
+    DEFAULT_LENGTH_BUCKETS,
+    LONGBENCH_V2_DATASET,
+    evaluate_longbench_v2,
+    parse_length,
+    parse_length_buckets,
+    save_longbench_results,
+)
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
@@ -175,7 +184,10 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
-                   max_problems=None):
+                   max_problems=None, longbench_v2_options=None):
+    if task_name == "LongBench-v2":
+        options = {"max_problems": max_problems, **(longbench_v2_options or {})}
+        return run_chat_longbench_v2_eval(model, tokenizer, **options)["longbench_v2_metric"]
     # Create the evaluation object
     task_module = {
         'HumanEval': HumanEval,
@@ -199,7 +211,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
 def parse_eval_modes(value):
     """Parse and validate the independently aggregated evaluation groups."""
     modes = tuple(dict.fromkeys(part.strip().lower() for part in value.split(",") if part.strip()))
-    valid_modes = {"chat", "babilong"}
+    valid_modes = {"chat", "babilong", "longbench-v2"}
     invalid_modes = set(modes) - valid_modes
     if not modes:
         raise ValueError("At least one evaluation mode is required")
@@ -316,6 +328,44 @@ def run_chat_babilong_eval(
         print0(f"BABILong example CSV directory: {results_dir}")
     return result
 
+
+def add_longbench_v2_arguments(parser):
+    group = parser.add_argument_group("LongBench-v2 (greedy direct-answer evaluation)")
+    group.add_argument('--longbench-v2-max-length', type=parse_length, default=None,
+                       help='Inclusive context-length limit, e.g. 16k or 32768 (1k=1024; default: no limit). Longer examples are excluded, not truncated.')
+    group.add_argument('--longbench-v2-length-buckets', type=parse_length_buckets, default=DEFAULT_LENGTH_BUCKETS,
+                       help='Increasing comma-separated boundaries for disjoint and cumulative scores (default: %(default)s)')
+    group.add_argument('--longbench-v2-length-unit', choices=('tokens', 'words'), default='tokens',
+                       help='Measure context using model tokenizer tokens or whitespace-separated words (default: tokens)')
+    group.add_argument('--longbench-v2-batch-size', type=int, default=1,
+                       help='Per-device generation batch size (default: 1 for long-context memory use)')
+    group.add_argument('--longbench-v2-max-new-tokens', type=int, default=128,
+                       help='Greedy answer generation budget (default: 128)')
+    group.add_argument('--longbench-v2-dataset', default=LONGBENCH_V2_DATASET,
+                       help='Hugging Face dataset repository (default: %(default)s)')
+    group.add_argument('--longbench-v2-cache-dir', default=None, help='Optional Hugging Face datasets cache directory')
+    group.add_argument('--longbench-v2-revision', default=None, help='Optional dataset commit/revision for reproducible runs')
+    group.add_argument('--longbench-v2-results-file', default=None,
+                       help='JSON output path (default: checkpoint-specific chat_eval_results directory)')
+
+
+def run_chat_longbench_v2_eval(model, tokenizer, results_path=None, **kwargs):
+    result = evaluate_longbench_v2(model, tokenizer, **kwargs)
+    overall = result['overall']
+    print0(f"\nLongBench-v2 accuracy: {100 * overall['accuracy']:.2f}% ({overall['correct']}/{overall['total']})")
+    for key, title in (("length_buckets", "length buckets"), ("length_cumulative", "cumulative lengths"),
+                       ("by_dataset_length", "dataset length labels"), ("by_difficulty", "difficulty"),
+                       ("by_domain", "domains")):
+        print0(f"LongBench-v2 {title}:")
+        for label, score in result[key].items():
+            accuracy = "n/a" if score['accuracy'] is None else f"{100 * score['accuracy']:.2f}%"
+            print0(f"  {label}: {accuracy} ({score['correct']}/{score['total']})")
+    print0(f"LongBench-v2 eval time: {result['eval_time_seconds']:.2f}s")
+    if results_path is not None and get_dist_info()[1] == 0:
+        output_path = save_longbench_results(results_path, result)
+        print0(f"Saved LongBench-v2 results: {output_path}")
+    return result
+
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -332,9 +382,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--eval', default='chat,babilong',
-        help='Comma-separated evaluations to run: chat,babilong (default: both)',
+        help='Comma-separated evaluations: chat,babilong,longbench-v2 (default: chat,babilong)',
     )
-    parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
+    parser.add_argument('-a', '--task-name', type=str, default=None, help="Chat task name, including LongBench-v2. Default = the five ChatCORE tasks. Use | to split multiple tasks.")
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
@@ -356,11 +406,14 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42, help='Global Python/NumPy/PyTorch seed (default: 42)')
     parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=True, help='Require deterministic algorithms (default: enabled)')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    add_longbench_v2_arguments(parser)
     args = parser.parse_args()
     try:
         eval_modes = parse_eval_modes(args.eval)
         babilong_tasks = parse_babilong_tasks(args.babilong_tasks)
         babilong_lengths = parse_babilong_lengths(args.babilong_lengths)
+        if args.longbench_v2_batch_size <= 0 or args.longbench_v2_max_new_tokens <= 0:
+            raise ValueError('LongBench-v2 batch size and max-new-tokens must be positive')
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -388,11 +441,14 @@ if __name__ == "__main__":
         'HumanEval': 0.0, # open-ended => 0%
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
+    run_longbench = 'longbench-v2' in eval_modes or ('chat' in eval_modes and 'LongBench-v2' in task_names)
 
     # Run all the task evaluations sequentially
     results = {}
     if 'chat' in eval_modes:
         for task_name in task_names:
+            if task_name == 'LongBench-v2':
+                continue  # Run once below, with its own options and aggregates.
             acc = run_chat_eval(
                 task_name,
                 model, tokenizer, engine,
@@ -411,11 +467,12 @@ if __name__ == "__main__":
     all_tasks_were_evaluated = all(task_name in results for task_name in all_tasks)
     if all_tasks_were_evaluated:
         centered_mean = 0
-        for task_name, acc in results.items():
+        for task_name in all_tasks:
+            acc = results[task_name]
             baseline_acc = baseline_accuracies.get(task_name, 0.0)
             centered_acc = (acc - baseline_acc) / (1.0 - baseline_acc)
             centered_mean += centered_acc
-        chatcore_metric = centered_mean / len(results)
+        chatcore_metric = centered_mean / len(all_tasks)
         print0(f"ChatCORE metric: {chatcore_metric:.4f}")
 
     # BABILong is reported separately and never contributes to ChatCORE.
@@ -445,6 +502,32 @@ if __name__ == "__main__":
             batch_size=args.babilong_batch_size,
             dataset_name=args.babilong_dataset,
             results_dir=babilong_results_dir,
+        )
+
+    # LongBench-v2 is independent of ChatCORE and BABILong; opt in explicitly.
+    if run_longbench:
+        results_path = args.longbench_v2_results_file
+        if results_path is None:
+            checkpoint_results_dir = os.path.dirname(resolve_babilong_results_dir(
+                None, get_base_dir(), args.source, args.model_tag, args.step, meta, loaded_model_type,
+            ))
+            limit = args.longbench_v2_max_length or 'all'
+            count = args.max_problems if args.max_problems is not None else 'all'
+            results_path = os.path.join(
+                checkpoint_results_dir, 'longbench-v2',
+                f'results_{args.longbench_v2_length_unit}_max_{limit}_seed_{args.seed}_n_{count}.json',
+            )
+        run_chat_longbench_v2_eval(
+            model, tokenizer, results_path=results_path,
+            max_length=args.longbench_v2_max_length,
+            length_unit=args.longbench_v2_length_unit,
+            length_buckets=args.longbench_v2_length_buckets,
+            batch_size=args.longbench_v2_batch_size,
+            max_new_tokens=args.longbench_v2_max_new_tokens,
+            max_problems=args.max_problems, seed=args.seed,
+            dataset_name=args.longbench_v2_dataset,
+            cache_dir=args.longbench_v2_cache_dir,
+            revision=args.longbench_v2_revision,
         )
 
     compute_cleanup()

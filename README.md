@@ -124,6 +124,66 @@ python -m scripts.chat_eval --source sft --model-tag armt_d4_sft
 Pass `--model-type armt` when you want the command to fail rather than
 accidentally load a GPT checkpoint with the same tag.
 
+### LongBench-v2 evaluation
+
+GPT and ARMT checkpoints support [LongBench-v2](https://huggingface.co/datasets/zai-org/LongBench-v2)
+in `chat_eval`. It is opt-in and does not contribute to ChatCORE or BABILong scores:
+
+```bash
+python -m scripts.chat_eval --source sft --model-tag armt_d4_sft \
+    --eval longbench-v2 \
+    --longbench-v2-max-length 32k \
+    --longbench-v2-length-buckets 16k,20k,32k \
+    --longbench-v2-batch-size 1
+```
+
+Use `--eval chat,babilong,longbench-v2` to run all evaluation groups, or
+`--eval chat -a 'ARC-Easy|LongBench-v2'` to select individual chat tasks.
+`--source base` also works for pretrained checkpoints. Existing defaults remain
+`--eval chat,babilong`, so old commands do not start this expensive benchmark.
+
+Length controls:
+
+- `--longbench-v2-max-length 16k` selects contexts of at most 16,384 tokens;
+  `32k` selects at most 32,768. Omit it to evaluate all lengths. **No truncation**
+  is applied; larger examples are excluded. The unfiltered dataset includes very
+  large contexts, so start with a cap appropriate for your GPU memory.
+- `--longbench-v2-length-unit tokens` (default) counts context tokens with the
+  loaded model's tokenizer. Use `words` for whitespace-separated word counts.
+  `1k = 1024` in either unit. Question, choices and chat framing are not included
+  in this length; saved `prompt_tokens` records the actual model input length.
+  Token-defined subsets can differ between tokenizers; use the same tokenizer
+  or word-based limits when comparing models.
+- `--longbench-v2-length-buckets 16k,20k,32k` reports non-overlapping buckets
+  `<=16k`, `(16k,20k]`, `(20k,32k]`, `>32k`, plus cumulative `<=16k`, `<=20k`,
+  `<=32k` scores. Default boundaries are `16k,20k,32k,64k,128k`.
+  Overall accuracy covers **all selected examples**, not excluded examples;
+  cumulative buckets also respect the cap. Empty buckets show `n/a` (JSON `null`).
+- `--max-problems N` selects a reproducible subset after filtering, using `--seed`.
+
+Loading/caching uses Hugging Face `datasets` and the released `train` split
+(this is the benchmark evaluation set, not training performed by this script).
+Override the repository with `--longbench-v2-dataset`, the cache location with
+`--longbench-v2-cache-dir`, and pin a commit with `--longbench-v2-revision`.
+
+Evaluation uses a nanochat-framed, non-CoT direct-answer prompt, greedy decoding,
+and the [upstream answer extraction rule](https://github.com/THUDM/LongBench/blob/main/pred.py):
+responses must contain `The correct answer is (A)` (or the unparenthesized
+equivalent, A–D); invalid responses count as incorrect. This uses an adapted
+prompt, not an exact reproduction of upstream leaderboard inference settings.
+`--longbench-v2-max-new-tokens` defaults to 128. The generic temperature/top-k/
+num-samples flags do not affect this benchmark. GPT uses batched KV decoding;
+ARMT uses the recurrent, variable-length padded path, as in BABILong evaluation.
+Both work with `torchrun`. Batch size defaults to 1 to limit long-context memory
+use and can be increased explicitly.
+
+Accuracy/counts for overall, length buckets, cumulative lengths, dataset length
+labels, difficulty and domains are printed. These scores, evaluation time,
+configuration, sample IDs/lengths, generated answers and correctness are saved to
+`$NANOCHAT_BASE_DIR/chat_eval_results/<source>/<model>/step_<step>/longbench-v2/`
+as JSON. Set `--longbench-v2-results-file /path/results.json` for an explicit file.
+Rerunning with the same output path replaces the previous results.
+
 ### BABILong training
 
 `scripts.babilong_train` trains either GPT or ARMTGPT with answer-only loss on

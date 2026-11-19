@@ -155,7 +155,7 @@ def _required_rotary_positions(model, real_tokens: int) -> int:
 
 
 @torch.no_grad()
-def _ensure_rotary_capacity(model, real_tokens: int) -> None:
+def _ensure_rotary_capacity(model, real_tokens: int, benchmark: str = "BABILong") -> None:
     """Grow nanochat's non-persistent RoPE cache for long evaluation prompts."""
     raw_model = getattr(model, "_orig_mod", model)
     if not all(hasattr(raw_model, name) for name in ("cos", "sin", "_precompute_rotary_embeddings")):
@@ -168,7 +168,7 @@ def _ensure_rotary_capacity(model, real_tokens: int) -> None:
     cos, sin = raw_model._precompute_rotary_embeddings(new_size, head_dim)
     raw_model.cos, raw_model.sin = cos, sin
     raw_model.rotary_seq_len = new_size
-    print0(f"Extended rotary cache to {new_size:,} positions for BABILong")
+    print0(f"Extended rotary cache to {new_size:,} positions for {benchmark}")
 
 
 def _terminal_token_ids(tokenizer) -> tuple[int, int]:
